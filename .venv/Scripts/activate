@@ -35,7 +35,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="C:\Users\sarth\OneDrive\Desktop\cirruslabs\AZ_Dir_API_POC\.venv"
+VIRTUAL_ENV="C:\Users\sarth\OneDrive\Desktop\cirruslabs\AZ_Dir_API_POC\Azure-Directory-API-POC\.venv"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

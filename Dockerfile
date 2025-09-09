@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim
+
+# --- Deployment Info ---
+# Replace with your actual Azure App Service URL later, e.g.:
+# https://your-app-name.azurewebsites.net
+# ------------------------
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Install Python deps (cache-friendly)
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# Copy app code
+COPY . .
+
+# Run as non-root
+RUN useradd -m appuser
+USER appuser
+
+EXPOSE 8000
+
+# Gunicorn with Uvicorn worker
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+

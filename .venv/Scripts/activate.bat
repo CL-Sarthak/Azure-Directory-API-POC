@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\sarth\OneDrive\Desktop\cirruslabs\AZ_Dir_API_POC\.venv
+set VIRTUAL_ENV=C:\Users\sarth\OneDrive\Desktop\cirruslabs\AZ_Dir_API_POC\Azure-Directory-API-POC\.venv
 
 if not defined PROMPT set PROMPT=$P$G
 
