@@ -1,18 +1,36 @@
-# 🔴 REMINDER: Replace all placeholders marked with <<< >>> before deploying
-# - <<<your-webapp-name>>> : the Azure Web App name (Linux, Docker)
-# - <<<owner>>>            : your GitHub username or org (used in GHCR image tag)
-# - <<<repo>>>             : your repo name (used in GHCR image tag)
-# - <<<secrets.AZURE_WEBAPP_PUBLISH_PROFILE>>> : set this secret in GitHub with the XML publish profile from Azure
+# 🔴 REMINDER: Replace all <<< >>> placeholders before you merge to main
+# Required replacements:
+# - <<<your-webapp-name>>> : Azure Web App (Linux, Docker) name (e.g., lt-graph-webhook)
+# - <<<owner>>>            : GitHub org/user for GHCR (e.g., cirruslabs)
+# - <<<repo>>>             : Repository name (e.g., Azure-Directory-API-POC)
+#
+# Required secrets in GitHub:
+# - secrets.AZURE_WEBAPP_PUBLISH_PROFILE  # Azure Web App publish profile XML (Download from Azure Portal)
+#
+# Azure Web App settings (set in Azure Portal → Configuration → Application settings):
+# - CLIENT_STATE = b2a6f37e-3d49-4b28-87d9-ccf2af95e4a2   # 🔐 your shared secret (DON'T put this in GitHub)
+# - WEBSITES_PORT = 8000                                   # required for Linux containers on App Service
+# - (optional) WEBSITES_CONTAINER_START_TIME_LIMIT = 300   # if cold starts take longer
+#
+# If your GHCR image is PRIVATE, configure registry credentials in Azure Web App (Deployment Center) OR
+# make the GHCR package PUBLIC (Settings → Packages → your image → change visibility).
+#
+# This workflow builds a Docker image, pushes to GHCR, then tells Azure Web App to pull that image.
 
 name: Deploy FastAPI (Docker) to Azure Web App
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main"]   # <<< change if your default branch is not 'main'
+
+# 🔁 Prevent overlapping deploys to the same app
+concurrency:
+  group: deploy-<<<your-webapp-name>>>
+  cancel-in-progress: true
 
 env:
-  WEBAPP_NAME: <<<your-webapp-name>>>                # Azure Web App name
-  IMAGE_NAME: ghcr.io/<<<owner>>>/<<<repo>>>:latest  # GHCR image tag
+  WEBAPP_NAME: <<<your-webapp-name>>>                # <<< Azure Web App name
+  IMAGE_NAME: ghcr.io/<<<owner>>>/<<<repo>>>:latest  # <<< GHCR image tag (owner/repo must match your repo)
 
 jobs:
   build-and-deploy:
@@ -20,35 +38,42 @@ jobs:
 
     permissions:
       contents: read
-      packages: write   # needed to push to GHCR
+      packages: write          # needed to push to GHCR
+      id-token: write          # future-proof if you switch to OIDC auth
 
     steps:
-      - name: Checkout
+      - name: 🧾 Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
+      - name: ⚙️ Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
+      - name: 🏗️ Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: 🔐 Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: 📦 Build and push image to GHCR
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile        # <<< change if your Dockerfile has a different path/name
           push: true
           tags: ${{ env.IMAGE_NAME }}
 
-      - name: Deploy to Azure Web App (Container)
+      # 🔴 Ensure Azure Web App has:
+      #   - CLIENT_STATE app setting set to b2a6f37e-3d49-4b28-87d9-ccf2af95e4a2
+      #   - WEBSITES_PORT app setting set to 8000
+      #   - (If GHCR image is PRIVATE) registry credentials configured in Azure
+
+      - name: 🚀 Deploy container image to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ${{ env.WEBAPP_NAME }}   # <<< replace with your app name
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }} # <<< set in repo secrets
-          images: ${{ env.IMAGE_NAME }}      # <<< matches IMAGE_NAME above
+          app-name: ${{ env.WEBAPP_NAME }}                         # <<< your app name
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}  # <<< repo secret
+          images: ${{ env.IMAGE_NAME }}                            # points to GHCR image tag above
