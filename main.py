@@ -36,9 +36,7 @@ async def notifications(request: Request):
             if not hmac.compare_digest(incoming, CLIENT_STATE):
                 return Response(status_code=401)
 
-    # ✅ Print the *entire JSON body* to server logs
     print("🔔 Incoming payload:")
     print(json.dumps(body, indent=2))
 
-    # ✅ Echo the *entire body* back in the HTTP response
     return JSONResponse(content=body, status_code=200)
