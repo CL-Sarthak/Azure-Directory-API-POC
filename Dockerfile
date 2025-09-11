@@ -1,20 +1,19 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-# --- Deployment Info ---
-# Replace with your actual Azure App Service URL later, e.g.:
-# https://your-app-name.azurewebsites.net
-# ------------------------
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Install Python deps (cache-friendly)
+# Install certs (good for HTTPS to Graph)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r requirements.txt
 
 # Copy app code
 COPY . .
@@ -25,6 +24,5 @@ USER appuser
 
 EXPOSE 8000
 
-# Gunicorn with Uvicorn worker
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-
+# Start script (make sure it exists & is executable)
+CMD ["./start.sh"]

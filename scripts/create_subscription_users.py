@@ -9,7 +9,7 @@ try:
     TENANT_ID = os.environ["TENANT_ID"]
     CLIENT_ID = os.environ["CLIENT_ID"]
     CLIENT_SECRET = os.environ["CLIENT_SECRET"]
-    NOTIFICATION_URL = os.environ["NOTIFICATION_URL"]  # e.g., https://<app>.azurewebsites.net/notifications
+    NOTIFICATION_URL = os.environ["NOTIFICATION_URL"]  #
 except KeyError as e:
     print(f"Missing env var: {e.args[0]}")
     sys.exit(1)

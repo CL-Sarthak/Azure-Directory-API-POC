@@ -4,7 +4,7 @@ services:
   web:
     build: .
     container_name: azure_dir_api_poc
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: ./start.sh
     volumes:
       - .:/app
     ports:
