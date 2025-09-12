@@ -1,9 +1,16 @@
 import os, hmac, json
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 app = FastAPI()
 
+app.add_middleware(HTTPSRedirectMiddleware)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["*.azurewebsites.net", "localhost", "127.0.0.1"]
+)
 # Load shared secret from env
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 if not CLIENT_STATE:
