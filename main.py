@@ -9,8 +9,26 @@ app = FastAPI()
 app.add_middleware(HTTPSRedirectMiddleware)
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*.azurewebsites.net", "localhost", "127.0.0.1"]
+    allowed_hosts=["*.azurewebsites.net", "localhost", "127.0.0.1", "ad-aapi-test.eastus.cloudapp.azure.com",]
 )
+
+
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+ 
+app = FastAPI()
+ 
+@app.post("/notification")
+async def notification(request: Request):
+    data = await request.json()
+    # If Graph is validating subscription
+    if "validationToken" in data:
+        token = data["validationToken"]
+        return PlainTextResponse(content=token, status_code=200)
+ 
+    # Otherwise it's a real notification
+    print("Got change notification:", data)
+    return {"status": "ok"}
 # Load shared secret from env
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 if not CLIENT_STATE:
@@ -43,7 +61,7 @@ async def notifications(request: Request):
             if not hmac.compare_digest(incoming, CLIENT_STATE):
                 return Response(status_code=401)
 
-    print("🔔 Incoming payload:")
-    print(json.dumps(body, indent=2))
+    print("🔔 Incoming payload:", flush=True)
+    print(json.dumps(body, indent=2), flush=True)
 
     return JSONResponse(content=body, status_code=200)
