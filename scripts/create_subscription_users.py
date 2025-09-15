@@ -1,77 +1,84 @@
 # scripts/create_subscription_users.py
-import os, sys, requests, datetime
+import os, sys, json, datetime, requests
 from dotenv import load_dotenv, find_dotenv
 
-# Load .env from project root (or wherever it is)
 load_dotenv(find_dotenv())
 
-def _diag():
-    # Tiny diagnostic to show what the process sees (masked)
-    def mask(v): 
-        return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
-    print("[diag] CWD:", os.getcwd())
-    print("[diag] TENANT_ID:", mask(os.getenv("TENANT_ID")))
-    print("[diag] CLIENT_ID:", mask(os.getenv("CLIENT_ID")))
-    print("[diag] CLIENT_SECRET set?:", "yes" if os.getenv("CLIENT_SECRET") else "no")
-    print("[diag] NOTIFICATION_URL:", os.getenv("NOTIFICATION_URL"))
-    print("[diag] CLIENT_STATE:", os.getenv("CLIENT_STATE") or "(default)")
+TENANT_ID = os.environ["TENANT_ID"]
+CLIENT_ID = os.environ["CLIENT_ID"]
+CLIENT_SECRET = os.environ["CLIENT_SECRET"]
+NOTIFICATION_URL = os.environ["NOTIFICATION_URL"]
+CLIENT_STATE = os.getenv("CLIENT_STATE", "")
+GROUP_ID = os.getenv("GROUP_ID", "").strip()  # optional
 
-_diag()
+AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# --- Required env vars ---
-try:
-    TENANT_ID = os.environ["TENANT_ID"]
-    CLIENT_ID = os.environ["CLIENT_ID"]
-    CLIENT_SECRET = os.environ["CLIENT_SECRET"]
-    NOTIFICATION_URL = os.environ["NOTIFICATION_URL"]
-except KeyError as e:
-    print(f"Missing env var: {e.args[0]}")
-    print("Tip: ensure a .env file exists and the script is reading it, or export vars in your shell.")
-    sys.exit(1)
+def mask(v): 
+    return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
 
-CLIENT_STATE = os.getenv("CLIENT_STATE", "poc-secret-value")
-
-def get_app_token() -> str:
-    resp = requests.post(
-        f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
+def get_token() -> str:
+    r = requests.post(
+        AUTH_URL,
         data={
-            "grant_type": "client_credentials",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials",
             "scope": "https://graph.microsoft.com/.default",
         },
         timeout=30,
     )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    r.raise_for_status()
+    return r.json()["access_token"]
 
-def main():
-    token = get_app_token()
-    expiration = (datetime.datetime.utcnow() + datetime.timedelta(days=27)).isoformat() + "Z"
+def create_subscription():
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Watch one group if GROUP_ID set; else watch all groups
+    resource = f"/groups/{GROUP_ID}" if GROUP_ID else "/groups"
+    # group membership changes are "updated" on the group resource
+    changeType = "updated"
+
+    # Expire in ~60 minutes (renew as needed)
+    exp = (datetime.datetime.utcnow() + datetime.timedelta(minutes=60)).replace(microsecond=0).isoformat() + "Z"
+
     payload = {
-        "changeType": "created,updated,deleted",
+        "changeType": changeType,
         "notificationUrl": NOTIFICATION_URL,
-        "resource": "users",
-        "expirationDateTime": expiration,
+        "resource": resource,
+        "expirationDateTime": exp,
         "clientState": CLIENT_STATE,
     }
-    resp = requests.post(
-        "https://graph.microsoft.com/v1.0/subscriptions",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json=payload, timeout=30,
-    )
-    print("Status:", resp.status_code)
-    try:
-        data = resp.json()
-        print("Response:", data)
-        if resp.ok:
-            print("\n✅ Subscription created.")
-            print("   id:", data.get("id"))
-            print("   resource:", data.get("resource"))
-            print("   expires:", data.get("expirationDateTime"))
-            print("\nMake sure your /notifications endpoint is HTTPS and echoes validationToken.")
-    except Exception:
-        print("Raw response:", resp.text)
+
+    print("[diag] Creating subscription with payload:")
+    print(json.dumps(payload, indent=2))
+
+    r = requests.post(f"{GRAPH_BASE}/subscriptions", headers=headers, json=payload, timeout=30)
+    if r.status_code >= 400:
+        print("[error]", r.status_code, r.text)
+        r.raise_for_status()
+    sub = r.json()
+    print("[ok] Created subscription:")
+    print(json.dumps(sub, indent=2))
+    return sub
+
+def list_subscriptions():
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(f"{GRAPH_BASE}/subscriptions", headers=headers, timeout=30)
+    r.raise_for_status()
+    subs = r.json()
+    print(json.dumps(subs, indent=2))
+    return subs
 
 if __name__ == "__main__":
-    main()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "create"
+    print("[diag] TENANT:", mask(TENANT_ID), "CLIENT:", mask(CLIENT_ID))
+    print("[diag] NOTIFICATION_URL:", NOTIFICATION_URL)
+    print("[diag] GROUP_ID:", GROUP_ID or "(all groups)")
+
+    if cmd == "list":
+        list_subscriptions()
+    else:
+        create_subscription()
