@@ -10,17 +10,15 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
 AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Tiny in-process token cache
+# very small in-memory token cache
 _token_cache = {"access_token": None, "expires_at": 0}
 
-def _mask(v: str) -> str:
-    return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
-
 def _now() -> int:
-    return int(time.time())
+    import time as _t
+    return int(_t.time())
 
 def get_token() -> str:
-    """Client-credentials token for Microsoft Graph."""
+    """Get a client-credentials token for Microsoft Graph (cached)."""
     global _token_cache
     if _token_cache["access_token"] and _token_cache["expires_at"] - 60 > _now():
         return _token_cache["access_token"]
@@ -38,13 +36,10 @@ def get_token() -> str:
         resp = c.post(AUTH_URL, data=data)
         resp.raise_for_status()
         payload = resp.json()
+
     access_token = payload["access_token"]
-    # Default to 1 hour if not provided
     expires_in = int(payload.get("expires_in", 3600))
-    _token_cache = {
-        "access_token": access_token,
-        "expires_at": _now() + expires_in,
-    }
+    _token_cache = {"access_token": access_token, "expires_at": _now() + expires_in}
     return access_token
 
 def graph_get(path: str, params: dict | None = None) -> dict:
@@ -73,7 +68,7 @@ def list_group_members(group_id: str) -> list[dict]:
             next_link = data.get("@odata.nextLink")
             if not next_link:
                 break
-            url = next_link  # already absolute
+            url = next_link  # absolute
     return items
 
 def diag_first_user() -> dict:
@@ -81,4 +76,3 @@ def diag_first_user() -> dict:
     data = graph_get("/users", params={"$top": 1, "$select": "id,displayName,mail,userPrincipalName"})
     value = data.get("value", [])
     return value[0] if value else {}
-
