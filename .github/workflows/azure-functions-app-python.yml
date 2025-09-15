@@ -1,36 +1,16 @@
-# 🔴 REMINDER: Replace all <<< >>> placeholders before you merge to main
-# Required replacements:
-# - <<<your-webapp-name>>> : Azure Web App (Linux, Docker) name (e.g., lt-graph-webhook)
-# - <<<owner>>>            : GitHub org/user for GHCR (e.g., cirruslabs)
-# - <<<repo>>>             : Repository name (e.g., Azure-Directory-API-POC)
-#
-# Required secrets in GitHub:
-# - secrets.AZURE_WEBAPP_PUBLISH_PROFILE  # Azure Web App publish profile XML (Download from Azure Portal)
-#
-# Azure Web App settings (set in Azure Portal → Configuration → Application settings):
-# - CLIENT_STATE = b2a6f37e-3d49-4b28-87d9-ccf2af95e4a2   # 🔐 your shared secret (DON'T put this in GitHub)
-# - WEBSITES_PORT = 8000                                   # required for Linux containers on App Service
-# - (optional) WEBSITES_CONTAINER_START_TIME_LIMIT = 300   # if cold starts take longer
-#
-# If your GHCR image is PRIVATE, configure registry credentials in Azure Web App (Deployment Center) OR
-# make the GHCR package PUBLIC (Settings → Packages → your image → change visibility).
-#
-# This workflow builds a Docker image, pushes to GHCR, then tells Azure Web App to pull that image.
-
 name: Deploy FastAPI (Docker) to Azure Web App
 
 on:
   push:
-    branches: ["main"]   # <<< change if your default branch is not 'main'
+    branches: ["main"] # change if your default branch differs
 
-# 🔁 Prevent overlapping deploys to the same app
 concurrency:
   group: deploy-<<<your-webapp-name>>>
   cancel-in-progress: true
 
 env:
-  WEBAPP_NAME: <<<your-webapp-name>>>                # <<< Azure Web App name
-  IMAGE_NAME: ghcr.io/<<<owner>>>/<<<repo>>>:latest  # <<< GHCR image tag (owner/repo must match your repo)
+  WEBAPP_NAME: <<<your-webapp-name>>>                 # Azure Web App (Linux, Docker)
+  IMAGE_BASENAME: ghcr.io/<<<owner>>>/<<<repo>>>      # GHCR repo (owner/repo)
 
 jobs:
   build-and-deploy:
@@ -38,8 +18,8 @@ jobs:
 
     permissions:
       contents: read
-      packages: write          # needed to push to GHCR
-      id-token: write          # future-proof if you switch to OIDC auth
+      packages: write         # push to GHCR
+      id-token: write
 
     steps:
       - name: 🧾 Checkout
@@ -58,22 +38,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 📦 Build and push image to GHCR
+      - name: 📦 Build and push image (latest + SHA)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile        # <<< change if your Dockerfile has a different path/name
+          file: ./Dockerfile
           push: true
-          tags: ${{ env.IMAGE_NAME }}
+          tags: |
+            ${{ env.IMAGE_BASENAME }}:latest
+            ${{ env.IMAGE_BASENAME }}:${{ github.sha }}
 
-      # 🔴 Ensure Azure Web App has:
-      #   - CLIENT_STATE app setting set to b2a6f37e-3d49-4b28-87d9-ccf2af95e4a2
-      #   - WEBSITES_PORT app setting set to 8000
-      #   - (If GHCR image is PRIVATE) registry credentials configured in Azure
-
+      # Azure pulls the exact SHA tag → guarantees fresh deploy every push
       - name: 🚀 Deploy container image to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ${{ env.WEBAPP_NAME }}                         # <<< your app name
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}  # <<< repo secret
-          images: ${{ env.IMAGE_NAME }}                            # points to GHCR image tag above
+          app-name: ${{ env.WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          images: ${{ env.IMAGE_BASENAME }}:${{ github.sha }}
+
+      # Optional warm-up check (use your app's public URL)
+      # - name: 🔎 Smoke test
+      #   run: |
+      #     set -e
+      #     URL="https://<<<your-webapp-name>>>.azurewebsites.net/api/graph/diag"
+      #     for i in {1..10}; do
+      #       echo "Attempt $i: $URL"
+      #       if curl -fsS "$URL" >/dev/null; then
+      #         echo "OK"
+      #         exit 0
+      #       fi
+      #       sleep 6
+      #     done
+      #     echo "Site did not respond in time"
+      #     exit 1
