@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
 from dotenv import load_dotenv
 
 # Load .env once at startup
@@ -23,7 +23,7 @@ logger = logging.getLogger("uvicorn")
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL") or ""
 
-# ---- lightweight in-app debug state (NEW) ----
+# ---- lightweight in-app debug state ----
 LAST_VALIDATION: Optional[Dict[str, Any]] = None
 LAST_POST: Optional[Dict[str, Any]] = None
 
@@ -60,9 +60,6 @@ async def root():
 async def graph_diag(raw: int = 0):
     """
     Quick connectivity check to Microsoft Graph using app-only creds.
-    - Success: returns sample user + masked env state.
-    - Failure: returns structured error with hints.
-    Add `?raw=1` to include full Graph error body (can be long).
     """
     diag = {
         "tenant_present": bool(os.getenv("TENANT_ID")),
@@ -144,10 +141,7 @@ async def group_members(group_id: str):
             }
             for m in members
         ]
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"count": len(simplified), "members": simplified},
-        )
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"count": len(simplified), "members": simplified})
     except httpx.HTTPStatusError as e:
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -166,7 +160,7 @@ async def group_members(group_id: str):
 
 
 # ------------------------
-# Graph handshake (GET)  — now records the last validation (NEW)
+# Graph handshake (GET) — records GET validations
 # ------------------------
 @app.get("/notifications")
 async def validate(request: Request, validationToken: str | None = None):
@@ -180,8 +174,7 @@ async def validate(request: Request, validationToken: str | None = None):
             "note": "Graph validation GET received",
         }
         LAST_VALIDATION = info
-        logger.info(f"[validation] {info}")
-        # IMPORTANT: plain text echo of the token
+        logger.info(f"[validation-get] {info}")
         return Response(content=validationToken, media_type="text/plain", status_code=200)
 
     info = {
@@ -196,11 +189,27 @@ async def validate(request: Request, validationToken: str | None = None):
 
 
 # ------------------------
-# Graph change notifications (POST) — now records the last POST (NEW)
+# Graph change notifications (POST) — handles POST validation too
 # ------------------------
 @app.post("/notifications")
 async def notifications(request: Request):
-    global LAST_POST
+    global LAST_POST, LAST_VALIDATION
+
+    # --- 1) Handle Graph validation via POST ?validationToken=... ---
+    token = request.query_params.get("validationToken")
+    if token:
+        info = {
+            "when": _now_iso(),
+            "token_len": len(token),
+            "client_ip": request.client.host if request.client else None,
+            "headers": dict(request.headers),
+            "note": "Graph validation POST received",
+        }
+        LAST_VALIDATION = info
+        logger.info(f"[validation-post] {info}")
+        return PlainTextResponse(token, status_code=200)
+
+    # --- 2) Normal change notification payload ---
     try:
         body = await request.json()
     except Exception:
@@ -237,18 +246,12 @@ async def notifications(request: Request):
     LAST_POST = info
     logger.info(f"[notification] {info}")
 
-    return JSONResponse(
-        status_code=200,
-        content=_ok("notification received", **info),
-    )
+    return JSONResponse(status_code=200, content=_ok("notification received", **info))
 
 
 # ------------------------
-# Debug endpoint to see what the app last received (NEW)
+# Debug endpoint
 # ------------------------
 @app.get("/notifications/debug")
 async def notifications_debug():
-    return {
-        "last_validation": LAST_VALIDATION,  # None if never seen
-        "last_post": LAST_POST,              # None if never seen
-    }
+    return {"last_validation": LAST_VALIDATION, "last_post": LAST_POST}
