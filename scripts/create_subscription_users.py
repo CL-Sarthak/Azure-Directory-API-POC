@@ -1,21 +1,32 @@
 # scripts/create_subscription_users.py
-import os, sys, json, datetime, requests
+import os, sys, json, datetime, requests, urllib.parse
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
 
-TENANT_ID = os.environ["TENANT_ID"]
-CLIENT_ID = os.environ["CLIENT_ID"]
-CLIENT_SECRET = os.environ["CLIENT_SECRET"]
-NOTIFICATION_URL = os.environ["NOTIFICATION_URL"]
-CLIENT_STATE = os.getenv("CLIENT_STATE", "")
-GROUP_ID = os.getenv("GROUP_ID", "").strip()  # optional
+TENANT_ID      = os.environ["TENANT_ID"]
+CLIENT_ID      = os.environ["CLIENT_ID"]
+CLIENT_SECRET  = os.environ["CLIENT_SECRET"]
+RAW_URL        = (os.environ["NOTIFICATION_URL"] or "").strip()
+CLIENT_STATE   = os.getenv("CLIENT_STATE", "")
+GROUP_ID       = os.getenv("GROUP_ID", "").strip()  # optional
 
-AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+AUTH_URL   = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 def mask(v): 
     return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
+
+def normalize_url(url: str) -> str:
+    u = urllib.parse.urlsplit(url.strip())
+    if u.scheme.lower() != "https":
+        raise ValueError("NOTIFICATION_URL must be HTTPS")
+    path = (u.path or "").rstrip("/")
+    if not path.endswith("/notifications"):
+        path = (path + "/notifications").replace("//", "/")
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, path, u.query, u.fragment))
+
+NOTIFICATION_URL = normalize_url(RAW_URL)
 
 def get_token() -> str:
     r = requests.post(
@@ -31,23 +42,30 @@ def get_token() -> str:
     r.raise_for_status()
     return r.json()["access_token"]
 
+def preflight_notification_url():
+    try:
+        resp = requests.get(f"{NOTIFICATION_URL}?validationToken=ping", timeout=10)
+        ok = (resp.status_code == 200 and resp.headers.get("content-type","").startswith("text/plain"))
+        return ok, resp.status_code, resp.text[:200]
+    except Exception as e:
+        return False, None, str(e)
+
+def resource_path():
+    return f"/groups/{GROUP_ID}" if GROUP_ID else "/groups"
+
+def expiry_iso(minutes: int = 60) -> str:
+    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes))\
+           .replace(microsecond=0).isoformat()
+
 def create_subscription():
     token = get_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Watch one group if GROUP_ID set; else watch all groups
-    resource = f"/groups/{GROUP_ID}" if GROUP_ID else "/groups"
-    # group membership changes are "updated" on the group resource
-    changeType = "updated"
-
-    # Expire in ~60 minutes (renew as needed)
-    exp = (datetime.datetime.utcnow() + datetime.timedelta(minutes=60)).replace(microsecond=0).isoformat() + "Z"
-
     payload = {
-        "changeType": changeType,
+        "changeType": "updated",
         "notificationUrl": NOTIFICATION_URL,
-        "resource": resource,
-        "expirationDateTime": exp,
+        "resource": resource_path(),
+        "expirationDateTime": expiry_iso(60),
         "clientState": CLIENT_STATE,
     }
 
@@ -63,14 +81,55 @@ def create_subscription():
     print(json.dumps(sub, indent=2))
     return sub
 
-def list_subscriptions():
-    token = get_token()
+def list_subscriptions(token=None):
+    token = token or get_token()
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get(f"{GRAPH_BASE}/subscriptions", headers=headers, timeout=30)
     r.raise_for_status()
-    subs = r.json()
-    print(json.dumps(subs, indent=2))
-    return subs
+    return r.json().get("value", [])
+
+def renew_subscription(sub_id: str):
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {"expirationDateTime": expiry_iso(60)}
+    r = requests.patch(f"{GRAPH_BASE}/subscriptions/{sub_id}", headers=headers, json=body, timeout=30)
+    if r.status_code >= 400:
+        print("[renew error]", r.status_code, r.text)
+        r.raise_for_status()
+    print(f"[ok] Renewed subscription {sub_id} until {body['expirationDateTime']}")
+    return r.json()
+
+def ensure_subscription():
+    ok, code, body = preflight_notification_url()
+    print(f"[preflight] {NOTIFICATION_URL} ok={ok} status={code} body={body!r}")
+    if not ok:
+        print("[preflight] WARNING: webhook did not echo 200 text/plain; Graph validation may fail", file=sys.stderr)
+
+    token = get_token()
+    subs = list_subscriptions(token)
+    res = resource_path()
+
+    # Find an existing matching subscription
+    match = next((s for s in subs
+                  if s.get("resource") == res and s.get("notificationUrl") == NOTIFICATION_URL), None)
+
+    if match:
+        # If expires soon (<10 min), renew; else keep
+        exp = match.get("expirationDateTime")
+        print(f"[diag] Found existing sub {match['id']} exp={exp}")
+        try:
+            expires_at = datetime.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            delta = expires_at - datetime.datetime.now(datetime.timezone.utc)
+            if delta.total_seconds() < 600:  # <10min
+                return renew_subscription(match["id"])
+            else:
+                print("[ok] Subscription still valid; no action")
+                return match
+        except Exception:
+            # if parsing fails, just renew
+            return renew_subscription(match["id"])
+    else:
+        return create_subscription()
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "create"
@@ -79,6 +138,18 @@ if __name__ == "__main__":
     print("[diag] GROUP_ID:", GROUP_ID or "(all groups)")
 
     if cmd == "list":
-        list_subscriptions()
+        print(json.dumps({"value": list_subscriptions()}, indent=2))
+    elif cmd == "ensure":
+        ensure_subscription()
+    elif cmd == "renew":
+        # crude renew of the first matching sub
+        subs = list_subscriptions()
+        res = resource_path()
+        match = next((s for s in subs if s.get("resource")==res and s.get("notificationUrl")==NOTIFICATION_URL), None)
+        if not match:
+            print("[renew] No matching subscription; creating new…")
+            create_subscription()
+        else:
+            renew_subscription(match["id"])
     else:
         create_subscription()
