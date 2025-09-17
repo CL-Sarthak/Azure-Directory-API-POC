@@ -68,8 +68,12 @@ def resource_path() -> str:
         return RESOURCE
     if GROUP_ID:
         if MEMBERSHIP:
+            # Subscription will fire on member add/remove → includes userId in resource path
             return f"/groups/{GROUP_ID}/members"
-        return f"/groups/{GROUP_ID}"
+        else:
+            # Plain group subscription: you will NOT see which user changed, only that the group changed
+            print("[warn] Subscribing to /groups/{id} (no per-user emails; set MEMBERSHIP=true for user details)")
+            return f"/groups/{GROUP_ID}"
     return "/groups"
 
 def expiry_iso(minutes: int) -> str:
