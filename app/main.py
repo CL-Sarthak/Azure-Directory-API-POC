@@ -148,11 +148,16 @@ async def group_members(group_id: str):
 # ------------------------
 # Graph handshake (GET)
 # ------------------------
+import logging
+from fastapi.responses import Response, JSONResponse
+
+logger = logging.getLogger("uvicorn")
+
 @app.get("/notifications")
 async def validate(validationToken: str | None = None):
     if validationToken:
-        # Echo token back with 200 to validate the webhook URL
-        return PlainTextResponse(validationToken, status_code=200)
+        logger.info(f"[validation] token len={len(validationToken)}")
+        return Response(content=validationToken, media_type="text/plain", status_code=200)
     return JSONResponse(status_code=200, content=_ok("notifications GET (no token)"))
 
 # ------------------------
