@@ -2,8 +2,12 @@
 import os
 import re
 import httpx
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, Response
 from dotenv import load_dotenv
 
 # Load .env once at startup
@@ -14,14 +18,27 @@ from app import graph as g  # noqa: E402
 
 app = FastAPI(title="Azure AD Webhook + Graph POC")
 
+logger = logging.getLogger("uvicorn")
+
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL") or ""
+
+# ---- lightweight in-app debug state (NEW) ----
+LAST_VALIDATION: Optional[Dict[str, Any]] = None
+LAST_POST: Optional[Dict[str, Any]] = None
+
 
 def _mask(v: str) -> str:
     return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
 
+
 def _ok(msg: str, **extra):
     return {"status": "OK", "message": msg, **extra}
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
 
 # ------------------------
 # Basic health
@@ -34,6 +51,7 @@ async def root():
         tenant_masked=_mask(os.getenv("TENANT_ID") or ""),
         client_masked=_mask(os.getenv("CLIENT_ID") or ""),
     )
+
 
 # ------------------------
 # URL #1: Graph connectivity diagnostic
@@ -109,6 +127,7 @@ async def graph_diag(raw: int = 0):
             content={"status": "ERROR", "message": "Unhandled error in diag endpoint", "error": str(e), **diag},
         )
 
+
 # ------------------------
 # URL #2: Show all members of a group (live from Graph)
 # ------------------------
@@ -145,39 +164,59 @@ async def group_members(group_id: str):
             content={"status": "ERROR", "message": "Unhandled error listing members", "error": str(e)},
         )
 
-# ------------------------
-# Graph handshake (GET)
-# ------------------------
-import logging
-from fastapi.responses import Response, JSONResponse
 
-logger = logging.getLogger("uvicorn")
-
+# ------------------------
+# Graph handshake (GET)  — now records the last validation (NEW)
+# ------------------------
 @app.get("/notifications")
-async def validate(validationToken: str | None = None):
+async def validate(request: Request, validationToken: str | None = None):
+    global LAST_VALIDATION
     if validationToken:
-        logger.info(f"[validation] token len={len(validationToken)}")
+        info = {
+            "when": _now_iso(),
+            "token_len": len(validationToken),
+            "client_ip": request.client.host if request.client else None,
+            "headers": dict(request.headers),
+            "note": "Graph validation GET received",
+        }
+        LAST_VALIDATION = info
+        logger.info(f"[validation] {info}")
+        # IMPORTANT: plain text echo of the token
         return Response(content=validationToken, media_type="text/plain", status_code=200)
+
+    info = {
+        "when": _now_iso(),
+        "client_ip": request.client.host if request.client else None,
+        "headers": dict(request.headers),
+        "note": "GET without validationToken",
+    }
+    LAST_VALIDATION = info
+    logger.info(f"[validation-miss] {info}")
     return JSONResponse(status_code=200, content=_ok("notifications GET (no token)"))
 
+
 # ------------------------
-# Graph change notifications (POST)
+# Graph change notifications (POST) — now records the last POST (NEW)
 # ------------------------
 @app.post("/notifications")
 async def notifications(request: Request):
+    global LAST_POST
     try:
         body = await request.json()
     except Exception:
+        LAST_POST = {"when": _now_iso(), "error": "invalid_json"}
         return JSONResponse({"error": "invalid_json"}, status_code=400)
 
     value = body.get("value") or []
     if not isinstance(value, list):
+        LAST_POST = {"when": _now_iso(), "error": "bad_payload", "raw": body}
         return JSONResponse({"error": "bad_payload"}, status_code=400)
 
     # Verify clientState (if supplied)
     for n in value:
         incoming = (n.get("clientState") or "").strip()
         if CLIENT_STATE and incoming and incoming != CLIENT_STATE:
+            LAST_POST = {"when": _now_iso(), "error": "client_state_mismatch", "raw": value}
             return JSONResponse({"error": "client_state_mismatch"}, status_code=403)
 
     # Extract changed group IDs from resource like "/groups/{id}"
@@ -188,7 +227,28 @@ async def notifications(request: Request):
         if m:
             changed_groups.append(m.group(1))
 
+    info = {
+        "when": _now_iso(),
+        "client_ip": request.client.host if request.client else None,
+        "count": len(value),
+        "groups": changed_groups,
+        "raw": value,
+    }
+    LAST_POST = info
+    logger.info(f"[notification] {info}")
+
     return JSONResponse(
         status_code=200,
-        content=_ok("notification received", count=len(value), groups=changed_groups, raw=value),
+        content=_ok("notification received", **info),
     )
+
+
+# ------------------------
+# Debug endpoint to see what the app last received (NEW)
+# ------------------------
+@app.get("/notifications/debug")
+async def notifications_debug():
+    return {
+        "last_validation": LAST_VALIDATION,  # None if never seen
+        "last_post": LAST_POST,              # None if never seen
+    }
