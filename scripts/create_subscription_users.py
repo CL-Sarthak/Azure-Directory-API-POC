@@ -8,14 +8,21 @@ TENANT_ID     = os.environ["TENANT_ID"]
 CLIENT_ID     = os.environ["CLIENT_ID"]
 CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 
-RAW_URL       = (os.environ["NOTIFICATION_URL"] or "").strip()
-CLIENT_STATE  = os.getenv("CLIENT_STATE", "").strip()
-GROUP_ID      = os.getenv("GROUP_ID", "").strip()            # optional
-LIFECYCLE_URL = os.getenv("LIFECYCLE_URL", "").strip()       # optional
-LATEST_TLS    = os.getenv("LATEST_TLS", "v1_2").strip()      # optional: v1_0|v1_1|v1_2|v1_3
-CHANGE_TYPES  = os.getenv("CHANGE_TYPES", "updated,deleted") # groups support updated (+created/soft delete) and deleted
-# Default to 28 days for directory resources (max ~29 days per MS Graph)
-SUB_MINUTES   = int(os.getenv("SUB_MINUTES", str(28 * 24 * 60)))
+RAW_URL          = (os.environ["NOTIFICATION_URL"] or "").strip()
+CLIENT_STATE     = os.getenv("CLIENT_STATE", "").strip()
+GROUP_ID         = os.getenv("GROUP_ID", "").strip()            # optional
+RESOURCE         = os.getenv("RESOURCE", "").strip()            # optional: overrides resource path entirely
+MEMBERSHIP       = os.getenv("MEMBERSHIP", "false").strip().lower() in {"1","true","yes"}  # if true and GROUP_ID present -> /groups/{id}/members
+LIFECYCLE_URL    = os.getenv("LIFECYCLE_URL", "").strip()       # optional
+LATEST_TLS       = os.getenv("LATEST_TLS", "v1_2").strip()      # v1_0|v1_1|v1_2|v1_3
+CHANGE_TYPES     = os.getenv("CHANGE_TYPES", "updated,deleted").strip()
+# Directory resources (users/groups) max is ~4230 minutes; default to that to avoid 400s. (≈ 2.94 days)
+SUB_MINUTES      = int(os.getenv("SUB_MINUTES", "4230"))
+
+# Optional rich notifications (encrypted resource data). Leave off unless you’ve set these.
+WITH_RESOURCE_DATA       = os.getenv("WITH_RESOURCE_DATA", "false").strip().lower() in {"1","true","yes"}
+ENCRYPTION_CERT_B64      = os.getenv("ENCRYPTION_CERT_BASE64", "").strip()      # base64 DER or PEM without headers
+ENCRYPTION_CERT_ID       = os.getenv("ENCRYPTION_CERT_ID", "").strip()
 
 AUTH_URL   = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -49,38 +56,50 @@ def get_token() -> str:
     return r.json()["access_token"]
 
 def preflight_notification_url():
-    """
-    Basic reachability sanity check.
-    NOTE: Graph will POST ?validationToken=...; this only verifies your endpoint answers something at all.
-    """
     try:
         resp = requests.get(f"{NOTIFICATION_URL}?validationToken=ping", timeout=10)
-        ok = (resp.status_code == 200 and resp.headers.get("content-type","").startswith("text/plain"))
-        return ok, resp.status_code, resp.text[:200]
+        ok = (resp.status_code == 200 and resp.headers.get("content-type","").lower().startswith("text/plain"))
+        return ok, resp.status_code, (resp.text[:200] if resp.text is not None else "")
     except Exception as e:
         return False, None, str(e)
 
 def resource_path() -> str:
-    return f"/groups/{GROUP_ID}" if GROUP_ID else "/groups"
+    if RESOURCE:
+        return RESOURCE
+    if GROUP_ID:
+        if MEMBERSHIP:
+            return f"/groups/{GROUP_ID}/members"
+        return f"/groups/{GROUP_ID}"
+    return "/groups"
 
 def expiry_iso(minutes: int) -> str:
-    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)).replace(microsecond=0).isoformat()
+    return (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
-def create_subscription():
-    token = get_token()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
+def _build_payload():
     payload = {
         "changeType": CHANGE_TYPES,
         "notificationUrl": NOTIFICATION_URL,
         "resource": resource_path(),
         "expirationDateTime": expiry_iso(SUB_MINUTES),
         "clientState": CLIENT_STATE,
-        # Nice-to-have hints to Graph:
         "latestSupportedTlsVersion": LATEST_TLS,
     }
     if LIFECYCLE_URL:
         payload["lifecycleNotificationUrl"] = LIFECYCLE_URL
+
+    if WITH_RESOURCE_DATA:
+        if not ENCRYPTION_CERT_B64 or not ENCRYPTION_CERT_ID:
+            raise ValueError("WITH_RESOURCE_DATA=true requires ENCRYPTION_CERT_BASE64 and ENCRYPTION_CERT_ID")
+        payload["includeResourceData"] = True
+        payload["encryptionCertificate"] = ENCRYPTION_CERT_B64
+        payload["encryptionCertificateId"] = ENCRYPTION_CERT_ID
+
+    return payload
+
+def create_subscription():
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = _build_payload()
 
     print("[diag] Creating subscription with payload:")
     print(json.dumps(payload, indent=2))
@@ -88,12 +107,10 @@ def create_subscription():
     r = requests.post(f"{GRAPH_BASE}/subscriptions", headers=headers, json=payload, timeout=30)
     if r.status_code >= 400:
         print("[error]", r.status_code, r.text)
-        # Helpful hint for the very common validation failure:
         if r.status_code == 400 and "ValidationError" in r.text:
             print(
-                "[hint] Graph validates by POSTing ?validationToken=... to your notificationUrl "
-                "and requires a 200 text/plain echo within 10 seconds. "
-                "Ensure your /notifications handler returns the raw token on POST as well as GET."
+                "[hint] Graph validates by sending a GET to ?validationToken=... on your notificationUrl. "
+                "Respond 200 text/plain with the raw token within 10s. Do NOT require auth on the validation GET."
             )
         r.raise_for_status()
     sub = r.json()
@@ -132,19 +149,21 @@ def ensure_subscription():
     subs = list_subscriptions(token)
     res  = resource_path()
 
-    # Match on resource + URL + changeTypes
-    match = next((s for s in subs
-                  if s.get("resource") == res
-                  and s.get("notificationUrl") == NOTIFICATION_URL
-                  and s.get("changeType") == CHANGE_TYPES), None)
+    def _matches(s):
+        if s.get("resource") != res: return False
+        if s.get("notificationUrl") != NOTIFICATION_URL: return False
+        if s.get("changeType") != CHANGE_TYPES: return False
+        if WITH_RESOURCE_DATA != bool(s.get("includeResourceData")): return False
+        return True
+
+    match = next((s for s in subs if _matches(s)), None)
 
     if match:
         exp = match.get("expirationDateTime")
         print(f"[diag] Found existing sub {match['id']} exp={exp}")
         try:
             expires_at = datetime.datetime.fromisoformat((exp or "").replace("Z", "+00:00"))
-            delta = expires_at - datetime.datetime.now(datetime.timezone.utc)
-            # renew if < 5 days left
+            delta = expires_at - datetime.datetime.now(datetime.UTC)
             if delta.total_seconds() < 5 * 24 * 3600:
                 return renew_subscription(match["id"])
             print("[ok] Subscription still valid; no action")
@@ -158,20 +177,21 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "create"
     print("[diag] TENANT:", mask(TENANT_ID), "CLIENT:", mask(CLIENT_ID))
     print("[diag] NOTIFICATION_URL:", NOTIFICATION_URL)
-    print("[diag] GROUP_ID:", GROUP_ID or "(all groups)")
+    print("[diag] RESOURCE:", resource_path(), "GROUP_ID:", GROUP_ID or "(n/a)")
     print("[diag] CHANGE_TYPES:", CHANGE_TYPES, "EXPIRES_IN_MIN:", SUB_MINUTES, "TLS:", LATEST_TLS or "(default)")
+    print("[diag] WITH_RESOURCE_DATA:", WITH_RESOURCE_DATA)
 
     if cmd == "list":
         print(json.dumps({"value": list_subscriptions()}, indent=2))
     elif cmd == "ensure":
         ensure_subscription()
     elif cmd == "renew":
-        # renew first matching sub
         subs = list_subscriptions()
         res  = resource_path()
         match = next((s for s in subs
                       if s.get("resource")==res and s.get("notificationUrl")==NOTIFICATION_URL
-                      and s.get("changeType")==CHANGE_TYPES), None)
+                      and s.get("changeType")==CHANGE_TYPES
+                      and bool(s.get("includeResourceData"))==WITH_RESOURCE_DATA), None)
         if not match:
             print("[renew] No matching subscription; creating new…")
             create_subscription()

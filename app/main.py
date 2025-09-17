@@ -1,13 +1,16 @@
 # app/main.py
 import os
 import re
+import json
+import html
 import httpx
 import logging
+import pathlib
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse, Response, PlainTextResponse
+from fastapi import FastAPI, Request, status, Form
+from fastapi.responses import JSONResponse, Response, PlainTextResponse, HTMLResponse
 from dotenv import load_dotenv
 
 # Load .env once at startup
@@ -17,15 +20,25 @@ load_dotenv()
 from app import graph as g  # noqa: E402
 
 app = FastAPI(title="Azure AD Webhook + Graph POC")
-
 logger = logging.getLogger("uvicorn")
 
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL") or ""
 
+# ---- new: graph app creds for lookup ----
+TENANT_ID = os.getenv("TENANT_ID") or ""
+CLIENT_ID = os.getenv("CLIENT_ID") or ""
+CLIENT_SECRET = os.getenv("CLIENT_SECRET") or ""
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+
 # ---- lightweight in-app debug state ----
 LAST_VALIDATION: Optional[Dict[str, Any]] = None
 LAST_POST: Optional[Dict[str, Any]] = None
+
+# ---- new: persistent event log (memory + file) ----
+EVENTS: List[Dict[str, Any]] = []
+LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")
 
 
 def _mask(v: str) -> str:
@@ -40,6 +53,123 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _append_event(kind: str, data: Dict[str, Any]):
+    event = {
+        "ts": _now_iso(),
+        "kind": kind,
+        **data,
+    }
+    EVENTS.append(event)
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"[log] failed to write {LOG_PATH}: {e}")
+
+
+def _load_events_from_disk():
+    if LOG_PATH.exists() and not EVENTS:
+        try:
+            with LOG_PATH.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    EVENTS.append(json.loads(line))
+        except Exception as e:
+            logger.warning(f"[log] failed to read {LOG_PATH}: {e}")
+
+
+def _render_html_log() -> str:
+    _load_events_from_disk()
+    rows = []
+    for ev in reversed(EVENTS):
+        kind = html.escape(ev.get("kind", ""))
+        ts = html.escape(ev.get("ts", ""))
+        ip = html.escape(str(ev.get("client_ip", "")))
+        summary = html.escape(ev.get("summary", "") or "")
+        raw = ev.get("raw")
+        if raw is None and "body" in ev:
+            raw = ev["body"]
+        raw_pretty = html.escape(json.dumps(raw, indent=2, ensure_ascii=False)) if raw is not None else ""
+        meta = ev.copy()
+        for k in ("raw", "body"):
+            meta.pop(k, None)
+        meta_pretty = html.escape(json.dumps(meta, indent=2, ensure_ascii=False))
+
+        rows.append(f"""
+        <article style="border:1px solid #e5e7eb; border-radius:12px; padding:12px; margin:10px 0;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h3 style="margin:0;font-family:system-ui,Segoe UI,Roboto;">{kind}</h3>
+            <div style="color:#6b7280;font-size:12px;">{ts} &middot; {ip}</div>
+          </div>
+          <div style="margin:6px 0; font-weight:600;">{summary}</div>
+          <details>
+            <summary style="cursor:pointer;">Raw payload</summary>
+            <pre style="white-space:pre-wrap; background:#0b1020; color:#d1e7ff; padding:10px; border-radius:8px; overflow:auto; font-size:12px;">{raw_pretty}</pre>
+          </details>
+          <details>
+            <summary style="cursor:pointer;">Meta</summary>
+            <pre style="white-space:pre-wrap; background:#111827; color:#e5e7eb; padding:10px; border-radius:8px; overflow:auto; font-size:12px;">{meta_pretty}</pre>
+          </details>
+        </article>
+        """)
+    body = "\n".join(rows) or "<p>No events yet.</p>"
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="5" />
+  <title>Graph Notifications Log</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+</head>
+<body style="margin:0; background:#f9fafb;">
+<header style="position:sticky; top:0; background:white; border-bottom:1px solid #e5e7eb; padding:12px;">
+  <div style="max-width:1000px; margin:0 auto; display:flex; justify-content:space-between; align-items:center;">
+    <h1 style="margin:0; font-family:system-ui,Segoe UI,Roboto; font-size:18px;">Graph Notifications Log</h1>
+    <form method="post" action="/notifications/log/clear" onsubmit="return confirm('Clear the log?');">
+      <button type="submit" style="padding:8px 12px; border:1px solid #ef4444; color:#ef4444; border-radius:8px; background:white;">Clear</button>
+    </form>
+  </div>
+</header>
+<main style="max-width:1000px; margin:0 auto; padding:12px;">
+  {body}
+</main>
+<footer style="text-align:center; color:#6b7280; padding:20px;">Auto-refreshing every 5s</footer>
+</body>
+</html>"""
+
+# ---- new: minimal Graph helper (app-only) ----
+async def _get_graph_token() -> str:
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            AUTH_URL,
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "client_credentials",
+                "scope": "https://graph.microsoft.com/.default",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+
+async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
+    token = await _get_graph_token()
+    url = f"{GRAPH_BASE}/users/{user_id}?$select=id,displayName,mail,userPrincipalName"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        u = r.json()
+        return {
+            "id": u.get("id"),
+            "displayName": u.get("displayName"),
+            "mail": u.get("mail"),
+            "userPrincipalName": u.get("userPrincipalName"),
+        }
+
 # ------------------------
 # Basic health
 # ------------------------
@@ -52,15 +182,11 @@ async def root():
         client_masked=_mask(os.getenv("CLIENT_ID") or ""),
     )
 
-
 # ------------------------
 # URL #1: Graph connectivity diagnostic
 # ------------------------
 @app.get("/api/graph/diag")
 async def graph_diag(raw: int = 0):
-    """
-    Quick connectivity check to Microsoft Graph using app-only creds.
-    """
     diag = {
         "tenant_present": bool(os.getenv("TENANT_ID")),
         "client_present": bool(os.getenv("CLIENT_ID")),
@@ -124,7 +250,6 @@ async def graph_diag(raw: int = 0):
             content={"status": "ERROR", "message": "Unhandled error in diag endpoint", "error": str(e), **diag},
         )
 
-
 # ------------------------
 # URL #2: Show all members of a group (live from Graph)
 # ------------------------
@@ -158,7 +283,6 @@ async def group_members(group_id: str):
             content={"status": "ERROR", "message": "Unhandled error listing members", "error": str(e)},
         )
 
-
 # ------------------------
 # Graph handshake (GET) — records GET validations
 # ------------------------
@@ -175,18 +299,10 @@ async def validate(request: Request, validationToken: str | None = None):
         }
         LAST_VALIDATION = info
         logger.info(f"[validation-get] {info}")
-        return Response(content=validationToken, media_type="text/plain", status_code=200)
+        _append_event("validation-get", {"client_ip": info["client_ip"], "summary": "GET validation", "raw": {"validationToken": validationToken}, **info})
+        return PlainTextResponse(validationToken, status_code=200)
 
-    info = {
-        "when": _now_iso(),
-        "client_ip": request.client.host if request.client else None,
-        "headers": dict(request.headers),
-        "note": "GET without validationToken",
-    }
-    LAST_VALIDATION = info
-    logger.info(f"[validation-miss] {info}")
-    return JSONResponse(status_code=200, content=_ok("notifications GET (no token)"))
-
+    return Response(status_code=204)
 
 # ------------------------
 # Graph change notifications (POST) — handles POST validation too
@@ -195,7 +311,6 @@ async def validate(request: Request, validationToken: str | None = None):
 async def notifications(request: Request):
     global LAST_POST, LAST_VALIDATION
 
-    # --- 1) Handle Graph validation via POST ?validationToken=... ---
     token = request.query_params.get("validationToken")
     if token:
         info = {
@@ -207,18 +322,20 @@ async def notifications(request: Request):
         }
         LAST_VALIDATION = info
         logger.info(f"[validation-post] {info}")
+        _append_event("validation-post", {"client_ip": info["client_ip"], "summary": "POST validation", "raw": {"validationToken": token}, **info})
         return PlainTextResponse(token, status_code=200)
 
-    # --- 2) Normal change notification payload ---
     try:
         body = await request.json()
     except Exception:
         LAST_POST = {"when": _now_iso(), "error": "invalid_json"}
+        _append_event("notification", {"client_ip": request.client.host if request.client else None, "summary": "Invalid JSON", "raw": None, **LAST_POST})
         return JSONResponse({"error": "invalid_json"}, status_code=400)
 
     value = body.get("value") or []
     if not isinstance(value, list):
         LAST_POST = {"when": _now_iso(), "error": "bad_payload", "raw": body}
+        _append_event("notification", {"client_ip": request.client.host if request.client else None, "summary": "Bad payload", "raw": body, **LAST_POST})
         return JSONResponse({"error": "bad_payload"}, status_code=400)
 
     # Verify clientState (if supplied)
@@ -226,32 +343,80 @@ async def notifications(request: Request):
         incoming = (n.get("clientState") or "").strip()
         if CLIENT_STATE and incoming and incoming != CLIENT_STATE:
             LAST_POST = {"when": _now_iso(), "error": "client_state_mismatch", "raw": value}
+            _append_event("notification", {"client_ip": request.client.host if request.client else None, "summary": "Client state mismatch", "raw": value, **LAST_POST})
             return JSONResponse({"error": "client_state_mismatch"}, status_code=403)
 
-    # Extract changed group IDs from resource like "/groups/{id}"
+    # Extract group ids and user ids from resource
     changed_groups: list[str] = []
+    changed_users: list[str] = []
     for n in value:
         res = (n.get("resource") or "").strip()
-        m = re.match(r"^/groups/([0-9a-fA-F-]{36})(?:$|/)", res)
-        if m:
-            changed_groups.append(m.group(1))
+
+        m_group = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})(?:$|/)", res)
+        if m_group:
+            changed_groups.append(m_group.group(1))
+
+        # /users/{userId}
+        m_user = re.match(r"^/?[Uu]sers/([0-9a-fA-F-]{36})(?:$|/)", res)
+        if m_user:
+            changed_users.append(m_user.group(1))
+            continue
+
+        # /groups/{groupId}/members/{userId} (sometimes the member id is present)
+        m_member = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})/(?:members|owners)/([0-9a-fA-F-]{36})(?:$|/)?", res)
+        if m_member:
+            changed_users.append(m_member.group(2))
+
+    # Deduplicate
+    changed_groups = sorted(set(changed_groups))
+    changed_users = sorted(set(changed_users))
+
+    # Optionally expand users to emails (best-effort; limit to a few to keep webhook fast)
+    expanded_users: List[Dict[str, Any]] = []
+    try:
+        for uid in changed_users[:10]:
+            u = await _get_user_basic(uid)
+            if u:
+                expanded_users.append(u)
+    except Exception as e:
+        logger.warning(f"[user-lookup] failed: {e}")
 
     info = {
         "when": _now_iso(),
         "client_ip": request.client.host if request.client else None,
         "count": len(value),
         "groups": changed_groups,
+        "users": changed_users,
+        "expanded_users": expanded_users,
         "raw": value,
+        "summary": f"{len(value)} notification(s) — groups: {', '.join(changed_groups) or '-'}; users: {', '.join(changed_users) or '-'}",
+        "note": ("No per-user emails available from /groups notifications. Subscribe to /users or /groups/{id}/members to resolve user emails."
+                 if not changed_users else None),
     }
     LAST_POST = info
     logger.info(f"[notification] {info}")
+    _append_event("notification", info)
 
     return JSONResponse(status_code=200, content=_ok("notification received", **info))
 
-
 # ------------------------
-# Debug endpoint
+# Debug + HTML log
 # ------------------------
 @app.get("/notifications/debug")
 async def notifications_debug():
-    return {"last_validation": LAST_VALIDATION, "last_post": LAST_POST}
+    _load_events_from_disk()
+    return {"last_validation": LAST_VALIDATION, "last_post": LAST_POST, "events": EVENTS[-50:]}
+
+@app.get("/notifications/log")
+async def notifications_log():
+    return HTMLResponse(_render_html_log(), status_code=200)
+
+@app.post("/notifications/log/clear")
+async def notifications_log_clear():
+    EVENTS.clear()
+    try:
+        if LOG_PATH.exists():
+            LOG_PATH.unlink()
+    except Exception as e:
+        logger.warning(f"[log] failed to clear {LOG_PATH}: {e}")
+    return HTMLResponse(_render_html_log(), status_code=200)
