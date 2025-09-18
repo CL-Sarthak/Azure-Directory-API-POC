@@ -10,18 +10,18 @@ CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 
 RAW_URL          = (os.environ["NOTIFICATION_URL"] or "").strip()
 CLIENT_STATE     = os.getenv("CLIENT_STATE", "").strip()
-GROUP_ID         = os.getenv("GROUP_ID", "").strip()            # optional
-RESOURCE         = os.getenv("RESOURCE", "").strip()            # optional: overrides resource path entirely
-MEMBERSHIP       = os.getenv("MEMBERSHIP", "false").strip().lower() in {"1","true","yes"}  # if true and GROUP_ID present -> /groups/{id}/members
-LIFECYCLE_URL    = os.getenv("LIFECYCLE_URL", "").strip()       # optional
+GROUP_ID         = os.getenv("GROUP_ID", "").strip()            # REQUIRED for membership-only
+RESOURCE         = os.getenv("RESOURCE", "").strip()            # optional: overrides everything
+MEMBERSHIP       = os.getenv("MEMBERSHIP", "true").strip().lower() in {"1","true","yes"}  # default true
+LIFECYCLE_URL    = os.getenv("LIFECYCLE_URL", "").strip()
 LATEST_TLS       = os.getenv("LATEST_TLS", "v1_2").strip()      # v1_0|v1_1|v1_2|v1_3
-CHANGE_TYPES     = os.getenv("CHANGE_TYPES", "updated,deleted").strip()
+CHANGE_TYPES     = os.getenv("CHANGE_TYPES", "created,updated,deleted").strip()
 # Directory resources (users/groups) max is ~4230 minutes; default to that to avoid 400s. (≈ 2.94 days)
 SUB_MINUTES      = int(os.getenv("SUB_MINUTES", "4230"))
 
 # Optional rich notifications (encrypted resource data). Leave off unless you’ve set these.
 WITH_RESOURCE_DATA       = os.getenv("WITH_RESOURCE_DATA", "false").strip().lower() in {"1","true","yes"}
-ENCRYPTION_CERT_B64      = os.getenv("ENCRYPTION_CERT_BASE64", "").strip()      # base64 DER or PEM without headers
+ENCRYPTION_CERT_B64      = os.getenv("ENCRYPTION_CERT_BASE64", "").strip()      # base64 DER or PEM sans headers
 ENCRYPTION_CERT_ID       = os.getenv("ENCRYPTION_CERT_ID", "").strip()
 
 AUTH_URL   = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
@@ -64,24 +64,31 @@ def preflight_notification_url():
         return False, None, str(e)
 
 def resource_path() -> str:
+    # Explicit override wins
     if RESOURCE:
         return RESOURCE
+
+    # Membership-only enforcement
+    if MEMBERSHIP:
+        if not GROUP_ID:
+            raise ValueError("MEMBERSHIP=true requires GROUP_ID to be set (subscribe to a specific group's members).")
+        # Subscribes specifically to membership relation changes (users/devices/SPs added/removed/updated)
+        return f"/groups/{GROUP_ID}/members"
+
+    # If someone disables MEMBERSHIP (not recommended for your use-case), we fallback to group object changes
     if GROUP_ID:
-        if MEMBERSHIP:
-            # Subscription will fire on member add/remove → includes userId in resource path
-            return f"/groups/{GROUP_ID}/members"
-        else:
-            # Plain group subscription: you will NOT see which user changed, only that the group changed
-            print("[warn] Subscribing to /groups/{id} (no per-user emails; set MEMBERSHIP=true for user details)")
-            return f"/groups/{GROUP_ID}"
-    return "/groups"
+        print("[warn] MEMBERSHIP=false — subscribing to /groups/{id} (group object changes ONLY, NOT membership).")
+        return f"/groups/{GROUP_ID}"
+
+    # Do NOT default to /groups (too broad + won’t tell you member changes)
+    raise ValueError("To track membership changes, set MEMBERSHIP=true and specify GROUP_ID.")
 
 def expiry_iso(minutes: int) -> str:
     return (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
 def _build_payload():
     payload = {
-        "changeType": CHANGE_TYPES,
+        "changeType": CHANGE_TYPES,                  # created,updated,deleted (membership adds/removes/updates)
         "notificationUrl": NOTIFICATION_URL,
         "resource": resource_path(),
         "expirationDateTime": expiry_iso(SUB_MINUTES),
@@ -181,7 +188,12 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "create"
     print("[diag] TENANT:", mask(TENANT_ID), "CLIENT:", mask(CLIENT_ID))
     print("[diag] NOTIFICATION_URL:", NOTIFICATION_URL)
-    print("[diag] RESOURCE:", resource_path(), "GROUP_ID:", GROUP_ID or "(n/a)")
+    try:
+        rp = resource_path()
+    except Exception as e:
+        print("[config error]", str(e))
+        sys.exit(2)
+    print("[diag] RESOURCE:", rp, "GROUP_ID:", GROUP_ID or "(n/a)")
     print("[diag] CHANGE_TYPES:", CHANGE_TYPES, "EXPIRES_IN_MIN:", SUB_MINUTES, "TLS:", LATEST_TLS or "(default)")
     print("[diag] WITH_RESOURCE_DATA:", WITH_RESOURCE_DATA)
 

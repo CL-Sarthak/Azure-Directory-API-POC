@@ -6,6 +6,8 @@ import html
 import httpx
 import logging
 import pathlib
+import hashlib
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 
@@ -39,6 +41,14 @@ LAST_POST: Optional[Dict[str, Any]] = None
 # ---- new: persistent event log (memory + file) ----
 EVENTS: List[Dict[str, Any]] = []
 LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")
+
+# ---- log behavior toggles ----
+LOG_AUTO_REFRESH_SECS = int(os.getenv("LOG_AUTO_REFRESH_SECS", "0"))  # 0 = no auto-refresh
+LOG_INCLUDE_VALIDATIONS = (os.getenv("LOG_INCLUDE_VALIDATIONS", "false").lower() == "true")
+LOG_DEDUP_WINDOW = int(os.getenv("LOG_DEDUP_WINDOW", "300"))  # seconds to keep recent keys for dedup
+
+# ---- dedup state ----
+_RECENT_KEYS: deque[tuple[str, float]] = deque(maxlen=500)  # (key, ts)
 
 
 def _mask(v: str) -> str:
@@ -80,6 +90,24 @@ def _load_events_from_disk():
             logger.warning(f"[log] failed to read {LOG_PATH}: {e}")
 
 
+def _hash_obj(o: Any) -> str:
+    # stable hash of the interesting payload (sort keys to normalize)
+    j = json.dumps(o, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(j.encode("utf-8")).hexdigest()
+
+
+def _seen_recent(key: str) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    # prune expired
+    while _RECENT_KEYS and (now - _RECENT_KEYS[0][1]) > LOG_DEDUP_WINDOW:
+        _RECENT_KEYS.popleft()
+    for k, _ts in _RECENT_KEYS:
+        if k == key:
+            return True
+    _RECENT_KEYS.append((key, now))
+    return False
+
+
 def _render_html_log() -> str:
     _load_events_from_disk()
     rows = []
@@ -115,11 +143,15 @@ def _render_html_log() -> str:
         </article>
         """)
     body = "\n".join(rows) or "<p>No events yet.</p>"
+
+    refresh_tag = f'<meta http-equiv="refresh" content="{LOG_AUTO_REFRESH_SECS}" />' if LOG_AUTO_REFRESH_SECS > 0 else ""
+    footer_text = f"Auto-refreshing every {LOG_AUTO_REFRESH_SECS}s" if LOG_AUTO_REFRESH_SECS > 0 else "Auto-refresh off (press ⟳)"
+
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="refresh" content="5" />
+  {refresh_tag}
   <title>Graph Notifications Log</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
 </head>
@@ -135,9 +167,10 @@ def _render_html_log() -> str:
 <main style="max-width:1000px; margin:0 auto; padding:12px;">
   {body}
 </main>
-<footer style="text-align:center; color:#6b7280; padding:20px;">Auto-refreshing every 5s</footer>
+<footer style="text-align:center; color:#6b7280; padding:20px;">{footer_text}</footer>
 </body>
 </html>"""
+
 
 # ---- new: minimal Graph helper (app-only) ----
 async def _get_graph_token() -> str:
@@ -153,6 +186,7 @@ async def _get_graph_token() -> str:
         )
         resp.raise_for_status()
         return resp.json()["access_token"]
+
 
 async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
     token = await _get_graph_token()
@@ -170,6 +204,7 @@ async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
             "userPrincipalName": u.get("userPrincipalName"),
         }
 
+
 # ------------------------
 # Basic health
 # ------------------------
@@ -181,6 +216,7 @@ async def root():
         tenant_masked=_mask(os.getenv("TENANT_ID") or ""),
         client_masked=_mask(os.getenv("CLIENT_ID") or ""),
     )
+
 
 # ------------------------
 # URL #1: Graph connectivity diagnostic
@@ -250,6 +286,7 @@ async def graph_diag(raw: int = 0):
             content={"status": "ERROR", "message": "Unhandled error in diag endpoint", "error": str(e), **diag},
         )
 
+
 # ------------------------
 # URL #2: Show all members of a group (live from Graph)
 # ------------------------
@@ -283,6 +320,7 @@ async def group_members(group_id: str):
             content={"status": "ERROR", "message": "Unhandled error listing members", "error": str(e)},
         )
 
+
 # ------------------------
 # Graph handshake (GET) — records GET validations
 # ------------------------
@@ -299,10 +337,12 @@ async def validate(request: Request, validationToken: str | None = None):
         }
         LAST_VALIDATION = info
         logger.info(f"[validation-get] {info}")
-        _append_event("validation-get", {"client_ip": info["client_ip"], "summary": "GET validation", "raw": {"validationToken": validationToken}, **info})
+        if LOG_INCLUDE_VALIDATIONS:
+            _append_event("validation-get", {"client_ip": info["client_ip"], "summary": "GET validation", "raw": {"validationToken": validationToken}, **info})
         return PlainTextResponse(validationToken, status_code=200)
 
     return Response(status_code=204)
+
 
 # ------------------------
 # Graph change notifications (POST) — handles POST validation too
@@ -322,20 +362,21 @@ async def notifications(request: Request):
         }
         LAST_VALIDATION = info
         logger.info(f"[validation-post] {info}")
-        _append_event("validation-post", {"client_ip": info["client_ip"], "summary": "POST validation", "raw": {"validationToken": token}, **info})
+        if LOG_INCLUDE_VALIDATIONS:
+            _append_event("validation-post", {"client_ip": info["client_ip"], "summary": "POST validation", "raw": {"validationToken": token}, **info})
         return PlainTextResponse(token, status_code=200)
 
     try:
         body = await request.json()
     except Exception:
         LAST_POST = {"when": _now_iso(), "error": "invalid_json"}
-        _append_event("notification", {"client_ip": request.client.host if request.client else None, "summary": "Invalid JSON", "raw": None, **LAST_POST})
+        # intentionally do not log invalid JSON repeatedly
         return JSONResponse({"error": "invalid_json"}, status_code=400)
 
     value = body.get("value") or []
     if not isinstance(value, list):
         LAST_POST = {"when": _now_iso(), "error": "bad_payload", "raw": body}
-        _append_event("notification", {"client_ip": request.client.host if request.client else None, "summary": "Bad payload", "raw": body, **LAST_POST})
+        # don't log bad payloads repeatedly
         return JSONResponse({"error": "bad_payload"}, status_code=400)
 
     # Verify clientState (if supplied)
@@ -343,7 +384,6 @@ async def notifications(request: Request):
         incoming = (n.get("clientState") or "").strip()
         if CLIENT_STATE and incoming and incoming != CLIENT_STATE:
             LAST_POST = {"when": _now_iso(), "error": "client_state_mismatch", "raw": value}
-            _append_event("notification", {"client_ip": request.client.host if request.client else None, "summary": "Client state mismatch", "raw": value, **LAST_POST})
             return JSONResponse({"error": "client_state_mismatch"}, status_code=403)
 
     # Extract group ids and user ids from resource
@@ -362,14 +402,24 @@ async def notifications(request: Request):
             changed_users.append(m_user.group(1))
             continue
 
-        # /groups/{groupId}/members/{userId} (sometimes the member id is present)
+        # /groups/{groupId}/members/{userId}
         m_member = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})/(?:members|owners)/([0-9a-fA-F-]{36})(?:$|/)?", res)
         if m_member:
             changed_users.append(m_member.group(2))
 
-    # Deduplicate
+    # Deduplicate lists
     changed_groups = sorted(set(changed_groups))
     changed_users = sorted(set(changed_users))
+
+    # If nothing interesting changed, ACK but don't log
+    if not value or (not changed_groups and not changed_users):
+        return JSONResponse(status_code=200, content=_ok("no-op notification"))
+
+    # Dedup by a stable key derived from the interesting bits
+    dedup_key = _hash_obj({"groups": changed_groups, "users": changed_users})
+    if _seen_recent(dedup_key):
+        # Already logged this combo recently; ACK but don't log again
+        return JSONResponse(status_code=200, content=_ok("duplicate notification (suppressed)"))
 
     # Optionally expand users to emails (best-effort; limit to a few to keep webhook fast)
     expanded_users: List[Dict[str, Any]] = []
@@ -390,14 +440,13 @@ async def notifications(request: Request):
         "expanded_users": expanded_users,
         "raw": value,
         "summary": f"{len(value)} notification(s) — groups: {', '.join(changed_groups) or '-'}; users: {', '.join(changed_users) or '-'}",
-        "note": ("No per-user emails available from /groups notifications. Subscribe to /users or /groups/{id}/members to resolve user emails."
-                 if not changed_users else None),
     }
     LAST_POST = info
     logger.info(f"[notification] {info}")
     _append_event("notification", info)
 
     return JSONResponse(status_code=200, content=_ok("notification received", **info))
+
 
 # ------------------------
 # Debug + HTML log
@@ -407,9 +456,11 @@ async def notifications_debug():
     _load_events_from_disk()
     return {"last_validation": LAST_VALIDATION, "last_post": LAST_POST, "events": EVENTS[-50:]}
 
+
 @app.get("/notifications/log")
 async def notifications_log():
     return HTMLResponse(_render_html_log(), status_code=200)
+
 
 @app.post("/notifications/log/clear")
 async def notifications_log_clear():
