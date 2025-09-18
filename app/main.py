@@ -204,6 +204,64 @@ async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
             "userPrincipalName": u.get("userPrincipalName"),
         }
 
+# --- membership delta helpers (persist deltaLink so next call is incremental) ---
+DELTA_STATE_FILE = pathlib.Path("/tmp/members_delta_state.json")
+
+def _load_delta_state() -> Dict[str, Any]:
+    try:
+        if DELTA_STATE_FILE.exists():
+            return json.loads(DELTA_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"[delta] load failed: {e}")
+    return {}
+
+def _save_delta_state(state: Dict[str, Any]) -> None:
+    try:
+        DELTA_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"[delta] save failed: {e}")
+
+async def _members_delta_once(group_id: str) -> Dict[str, list]:
+    """
+    One delta sweep for the group's members.
+    Returns {'added': [userIds], 'removed': [userIds]} and stores deltaLink for next time.
+    """
+    state = _load_delta_state()
+    prev = state.get(group_id, {}).get("deltaLink")
+
+    token = await _get_graph_token()
+    # Only fetch ids here; we expand to names/emails via _get_user_basic()
+    url = prev or f"{GRAPH_BASE}/groups/{group_id}/members/delta?$select=id&$top=999"
+
+    added, removed = set(), set()
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+            r.raise_for_status()
+            data = r.json()
+
+            for item in data.get("value", []):
+                oid = item.get("id")
+                if not oid:
+                    continue
+                if "@removed" in item:
+                    removed.add(oid)
+                else:
+                    added.add(oid)
+
+            nxt = data.get("@odata.nextLink")
+            if nxt:
+                url = nxt
+                continue
+
+            dl = data.get("@odata.deltaLink")
+            if dl:
+                state[group_id] = {"deltaLink": dl, "ts": _now_iso()}
+                _save_delta_state(state)
+            break
+
+    return {"added": sorted(added), "removed": sorted(removed)}
+
 
 # ------------------------
 # Basic health
@@ -421,15 +479,60 @@ async def notifications(request: Request):
         # Already logged this combo recently; ACK but don't log again
         return JSONResponse(status_code=200, content=_ok("duplicate notification (suppressed)"))
 
-    # Optionally expand users to emails (best-effort; limit to a few to keep webhook fast)
+    # -------------------
+    # Expand user details + delta fallback
+    # -------------------
+    def _fmt_user(u: Dict[str, Any]) -> str:
+        name = u.get("displayName") or u.get("userPrincipalName") or u.get("id")
+        mail = u.get("mail") or "-"
+        return f"{name} <{mail}>"
+
     expanded_users: List[Dict[str, Any]] = []
-    try:
-        for uid in changed_users[:10]:
-            u = await _get_user_basic(uid)
-            if u:
-                expanded_users.append(u)
-    except Exception as e:
-        logger.warning(f"[user-lookup] failed: {e}")
+    expanded_added: List[Dict[str, Any]] = []
+    expanded_removed: List[Dict[str, Any]] = []
+
+    if changed_users:
+        # Fast path: notification resource included /members/{userId}
+        try:
+            for uid in changed_users[:10]:  # keep webhook fast
+                u = await _get_user_basic(uid)
+                if u:
+                    expanded_users.append(u)
+        except Exception as e:
+            logger.warning(f"[user-lookup fast-path] failed: {e}")
+    else:
+        # Fallback: Graph didn't include memberId => run one delta to figure out who changed
+        try:
+            target_group_id = (changed_groups[0] if changed_groups else None)
+            if target_group_id:
+                delta = await _members_delta_once(target_group_id)
+                # Expand a few for readability
+                for uid in delta["added"][:10]:
+                    u = await _get_user_basic(uid)
+                    if u: expanded_added.append(u)
+                for uid in delta["removed"][:10]:
+                    try:
+                        u = await _get_user_basic(uid)
+                    except Exception:
+                        u = None
+                    expanded_removed.append(u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None})
+        except Exception as e:
+            logger.warning(f"[delta fallback] failed: {e}")
+
+    # Build a friendly summary
+    summary_parts = [f"{len(value)} notification(s)"]
+    if changed_groups:
+        summary_parts.append(f"groups: {', '.join(changed_groups)}")
+
+    if expanded_users:
+        summary_parts.append("users: " + "; ".join(_fmt_user(u) for u in expanded_users))
+    else:
+        if expanded_added:
+            summary_parts.append("added: " + "; ".join(_fmt_user(u) for u in expanded_added))
+        if expanded_removed:
+            summary_parts.append("removed: " + "; ".join(_fmt_user(u) for u in expanded_removed))
+
+    # -------------------
 
     info = {
         "when": _now_iso(),
@@ -438,8 +541,10 @@ async def notifications(request: Request):
         "groups": changed_groups,
         "users": changed_users,
         "expanded_users": expanded_users,
+        "expanded_added": expanded_added,
+        "expanded_removed": expanded_removed,
         "raw": value,
-        "summary": f"{len(value)} notification(s) — groups: {', '.join(changed_groups) or '-'}; users: {', '.join(changed_users) or '-'}",
+        "summary": " | ".join(summary_parts),
     }
     LAST_POST = info
     logger.info(f"[notification] {info}")
