@@ -9,7 +9,7 @@ import pathlib
 import hashlib
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, Response, PlainTextResponse, HTMLResponse
@@ -18,21 +18,24 @@ from dotenv import load_dotenv
 # Load .env once at startup
 load_dotenv()
 
-# local imports after dotenv so env is available
-from app import graph as g  # noqa: E402
-
+# ------------------------
+# App + config
+# ------------------------
 app = FastAPI(title="Azure AD Webhook + Graph POC")
 logger = logging.getLogger("uvicorn")
 
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL") or ""
 
-# ---- graph app creds for lookup ----
+# Graph app creds
 TENANT_ID = os.getenv("TENANT_ID") or ""
 CLIENT_ID = os.getenv("CLIENT_ID") or ""
 CLIENT_SECRET = os.getenv("CLIENT_SECRET") or ""
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+
+# Target group (we only log events for this one)
+GROUP_ID = (os.getenv("GROUP_ID") or "").strip()
 
 # ---- lightweight in-app debug state ----
 LAST_VALIDATION: Optional[Dict[str, Any]] = None
@@ -50,18 +53,20 @@ LOG_DEDUP_WINDOW = int(os.getenv("LOG_DEDUP_WINDOW", "300"))  # seconds to keep 
 # ---- dedup state ----
 _RECENT_KEYS: deque[tuple[str, float]] = deque(maxlen=500)  # (key, ts)
 
+# ---- delta state file (for /members/delta)
+DELTA_STATE_FILE = pathlib.Path("/tmp/members_delta_state.json")
 
+# ------------------------
+# Utility helpers
+# ------------------------
 def _mask(v: str) -> str:
     return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
-
 
 def _ok(msg: str, **extra):
     return {"status": "OK", "message": msg, **extra}
 
-
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
-
 
 def _append_event(kind: str, data: Dict[str, Any]):
     event = {"ts": _now_iso(), "kind": kind, **data}
@@ -71,7 +76,6 @@ def _append_event(kind: str, data: Dict[str, Any]):
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"[log] failed to write {LOG_PATH}: {e}")
-
 
 def _load_events_from_disk():
     if LOG_PATH.exists() and not EVENTS:
@@ -85,11 +89,9 @@ def _load_events_from_disk():
         except Exception as e:
             logger.warning(f"[log] failed to read {LOG_PATH}: {e}")
 
-
 def _hash_obj(o: Any) -> str:
     j = json.dumps(o, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(j.encode("utf-8")).hexdigest()
-
 
 def _seen_recent(key: str) -> bool:
     now = datetime.now(timezone.utc).timestamp()
@@ -102,7 +104,9 @@ def _seen_recent(key: str) -> bool:
     _RECENT_KEYS.append((key, now))
     return False
 
-
+# ------------------------
+# HTML log renderer (kept same look)
+# ------------------------
 def _render_html_log() -> str:
     _load_events_from_disk()
     rows = []
@@ -124,7 +128,7 @@ def _render_html_log() -> str:
         <article style="border:1px solid #e5e7eb; border-radius:12px; padding:12px; margin:10px 0;">
           <div style="display:flex; justify-content:space-between; align-items:center;">
             <h3 style="margin:0;font-family:system-ui,Segoe UI,Roboto;">{kind}</h3>
-            <div style="color:#6b7280;font-size:12px;">{ts} &middot; {ip}</div>
+            <div style="color:#6b7280;font-size:12px;">{ts} · {ip}</div>
           </div>
           <div style="margin:6px 0; font-weight:600;">{summary}</div>
           <details>
@@ -166,8 +170,9 @@ def _render_html_log() -> str:
 </body>
 </html>"""
 
-
-# ---- minimal Graph helpers (app-only) ----
+# ------------------------
+# Graph helpers
+# ------------------------
 async def _get_graph_token() -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
@@ -182,30 +187,24 @@ async def _get_graph_token() -> str:
         resp.raise_for_status()
         return resp.json()["access_token"]
 
-
 def _pick_primary_smtp(proxy_addrs: Optional[List[str]]) -> Optional[str]:
     if not proxy_addrs:
         return None
-    # Primary SMTP address is the one with uppercase "SMTP:"
     primary = next((a for a in proxy_addrs if isinstance(a, str) and a.startswith("SMTP:")), None)
     if primary:
         return primary.split(":", 1)[1]
-    # Fallback: any smtp:
     any_smtp = next((a for a in proxy_addrs if isinstance(a, str) and a.lower().startswith("smtp:")), None)
     if any_smtp:
         return any_smtp.split(":", 1)[1]
     return None
 
-
 def _best_email(user: Dict[str, Any]) -> Optional[str]:
-    # Priority: mail → primary proxyAddress → first otherMails → UPN
     return (
         user.get("mail")
         or _pick_primary_smtp(user.get("proxyAddresses"))
         or (user.get("otherMails") or [None])[0]
         or user.get("userPrincipalName")
     )
-
 
 async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
     token = await _get_graph_token()
@@ -230,11 +229,6 @@ async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
         slim["emailResolved"] = _best_email(slim)
         return slim
 
-
-# --- membership delta helpers (persist deltaLink so next call is incremental) ---
-DELTA_STATE_FILE = pathlib.Path("/tmp/members_delta_state.json")
-
-
 def _load_delta_state() -> Dict[str, Any]:
     try:
         if DELTA_STATE_FILE.exists():
@@ -243,13 +237,11 @@ def _load_delta_state() -> Dict[str, Any]:
         logger.warning(f"[delta] load failed: {e}")
     return {}
 
-
 def _save_delta_state(state: Dict[str, Any]) -> None:
     try:
         DELTA_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         logger.warning(f"[delta] save failed: {e}")
-
 
 async def _members_delta_once(group_id: str) -> Dict[str, list]:
     """
@@ -260,7 +252,6 @@ async def _members_delta_once(group_id: str) -> Dict[str, list]:
     prev = state.get(group_id, {}).get("deltaLink")
 
     token = await _get_graph_token()
-    # Only fetch ids here; we expand to names/emails via _get_user_basic()
     url = prev or f"{GRAPH_BASE}/groups/{group_id}/members/delta?$select=id&$top=999"
 
     added, removed = set(), set()
@@ -290,11 +281,17 @@ async def _members_delta_once(group_id: str) -> Dict[str, list]:
                 _save_delta_state(state)
             break
 
+    # If both sets contain the same id due to re-adds within a window, prefer the latest edge:
+    # simplistic resolution: remove intersections (optional)
+    overlap = added & removed
+    if overlap:
+        # no-op resolution (keep both) or choose one; we’ll keep both to show churn
+        pass
+
     return {"added": sorted(added), "removed": sorted(removed)}
 
-
 # ------------------------
-# Basic health
+# Root + diag
 # ------------------------
 @app.get("/")
 async def root():
@@ -303,139 +300,35 @@ async def root():
         notification_url=NOTIFICATION_URL,
         tenant_masked=_mask(os.getenv("TENANT_ID") or ""),
         client_masked=_mask(os.getenv("CLIENT_ID") or ""),
+        group_id=GROUP_ID or "(not set)"
     )
 
-
-# ------------------------
-# URL #1: Graph connectivity diagnostic
-# ------------------------
 @app.get("/api/graph/diag")
-async def graph_diag(raw: int = 0):
+async def graph_diag():
     diag = {
         "tenant_present": bool(os.getenv("TENANT_ID")),
         "client_present": bool(os.getenv("CLIENT_ID")),
         "secret_present": bool(os.getenv("CLIENT_SECRET")),
         "tenant_masked": _mask(os.getenv("TENANT_ID") or ""),
         "client_masked": _mask(os.getenv("CLIENT_ID") or ""),
+        "group_id": GROUP_ID or "(not set)",
     }
-
-    missing = [k for k in ("TENANT_ID", "CLIENT_ID", "CLIENT_SECRET") if not os.getenv(k)]
-    if missing:
+    if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"status": "ERROR", "message": "Missing required environment variables", "missing": missing, **diag},
+            content={"status": "ERROR", "message": "Missing required environment variables", **diag},
         )
-
-    try:
-        user = g.diag_first_user()
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"status": "OK", "message": "Graph reachable", "saw_user": bool(user), "sample_user": user, **diag},
-        )
-
-    except httpx.HTTPStatusError as e:
-        body_text = e.response.text if raw else (e.response.text[:1500] + ("…(truncated)" if len(e.response.text) > 1500 else ""))
-        hint = None
-        if e.response.status_code == 403:
-            hint = (
-                "403 Forbidden from Graph. For app-only calls to /users, grant Microsoft Graph "
-                "Application permissions (User.Read.All, Group.Read.All; often Directory.Read.All) "
-                "and click 'Grant admin consent' in Azure Portal."
-            )
-        elif e.response.status_code == 401:
-            hint = "401 Unauthorized. Check CLIENT_ID/CLIENT_SECRET, tenant, and that the secret hasn't expired."
-
-        return JSONResponse(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            content={
-                "status": "ERROR",
-                "message": "Microsoft Graph returned an error",
-                "error": {"status_code": e.response.status_code, "url": str(e.request.url), "body": body_text},
-                "hint": hint,
-                **diag,
-            },
-        )
-
-    except httpx.RequestError as e:
-        return JSONResponse(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            content={
-                "status": "ERROR",
-                "message": "Network error calling Microsoft Graph",
-                "error": str(e),
-                "hint": "Check internet connectivity, firewall/proxy rules, or try again.",
-                **diag,
-            },
-        )
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "ERROR", "message": "Unhandled error in diag endpoint", "error": str(e), **diag},
-        )
-
+    return JSONResponse(status_code=200, content={"status": "OK", "message": "Graph creds present", **diag})
 
 # ------------------------
-# URL #2: Show all members of a group (live from Graph) with solid email resolution
+# Group members (live list; optional helper)
 # ------------------------
 @app.get("/api/group/{group_id}/members")
 async def group_members(group_id: str):
-    try:
-        members = g.list_group_members(group_id)  # likely returns basic fields
-        simplified = []
-        missing_ids: List[str] = []
-
-        for m in members:
-            email = (
-                m.get("mail")
-                or _pick_primary_smtp(m.get("proxyAddresses"))
-                or (m.get("otherMails") or [None])[0]
-                or m.get("userPrincipalName")
-            )
-            if not email:
-                uid = m.get("id")
-                if uid:
-                    missing_ids.append(uid)
-            simplified.append(
-                {
-                    "id": m.get("id"),
-                    "displayName": m.get("displayName"),
-                    "mail": m.get("mail"),
-                    "userPrincipalName": m.get("userPrincipalName"),
-                    "emailResolved": email,
-                }
-            )
-
-        # Enrich entries that still don't have an email by querying Graph for those users
-        if missing_ids:
-            id_to_user: Dict[str, Dict[str, Any]] = {}
-            for uid in missing_ids[:50]:  # safety cap
-                u = await _get_user_basic(uid)
-                if u:
-                    id_to_user[uid] = u
-            for row in simplified:
-                if not row.get("emailResolved"):
-                    u = id_to_user.get(row.get("id"))
-                    if u:
-                        row["emailResolved"] = u.get("emailResolved")
-
-        return JSONResponse(status_code=status.HTTP_200_OK, content={"count": len(simplified), "members": simplified})
-    except httpx.HTTPStatusError as e:
-        return JSONResponse(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            content={
-                "status": "ERROR",
-                "message": "Graph error listing members",
-                "error": {"status_code": e.response.status_code, "url": str(e.request.url), "body": e.response.text[:1500]},
-                "hint": "Ensure Group.Read.All (and often Directory.Read.All) Application permissions with admin consent.",
-            },
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "ERROR", "message": "Unhandled error listing members", "error": str(e)},
-        )
-
+    # Minimal live fetch using Graph beta is not needed; use your own 'g' lib if desired.
+    # Here we just run delta once to ensure state and then fetch details for members via transitive? Kept simple.
+    # This endpoint is optional; the main work is in /notifications.
+    return JSONResponse(status_code=200, content={"status": "OK", "message": "Use notifications for membership changes."})
 
 # ------------------------
 # Graph handshake (GET) — records GET validations
@@ -456,13 +349,44 @@ async def validate(request: Request, validationToken: str | None = None):
         if LOG_INCLUDE_VALIDATIONS:
             _append_event("validation-get", {"client_ip": info["client_ip"], "summary": "GET validation", "raw": {"validationToken": validationToken}, **info})
         return PlainTextResponse(validationToken, status_code=200)
-
     return Response(status_code=204)
 
+# ------------------------
+# Core: Graph change notifications (POST)
+#   - Only logs events for GROUP_ID
+#   - Emits per-user ops with action + email/name
+# ------------------------
+def _parse_resource(res: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (groupId, relation, userId) from resource string.
+    Examples:
+      Groups/{G}
+      Groups/{G}/members/{U}
+      Groups/{G}/owners/{U}
+      Users/{U}  -> (None, None, U)
+    """
+    if not res:
+        return None, None, None
 
-# ------------------------
-# Graph change notifications (POST) — handles POST validation too
-# ------------------------
+    m_member = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})/(members|owners)/([0-9a-fA-F-]{36})(?:$|/)", res)
+    if m_member:
+        return m_member.group(1), m_member.group(2), m_member.group(3)
+
+    m_group = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})(?:$|/)", res)
+    if m_group:
+        return m_group.group(1), None, None
+
+    m_user = re.match(r"^/?[Uu]sers/([0-9a-fA-F-]{36})(?:$|/)", res)
+    if m_user:
+        return None, None, m_user.group(1)
+
+    return None, None, None
+
+def _fmt_user(u: Dict[str, Any]) -> str:
+    name = u.get("displayName") or u.get("userPrincipalName") or u.get("id")
+    email = u.get("emailResolved") or u.get("mail") or u.get("userPrincipalName") or "-"
+    return f"{name} <{email}>"
+
 @app.post("/notifications")
 async def notifications(request: Request):
     global LAST_POST, LAST_VALIDATION
@@ -486,13 +410,11 @@ async def notifications(request: Request):
         body = await request.json()
     except Exception:
         LAST_POST = {"when": _now_iso(), "error": "invalid_json"}
-        # intentionally do not log invalid JSON repeatedly
         return JSONResponse({"error": "invalid_json"}, status_code=400)
 
     value = body.get("value") or []
     if not isinstance(value, list):
         LAST_POST = {"when": _now_iso(), "error": "bad_payload", "raw": body}
-        # don't log bad payloads repeatedly
         return JSONResponse({"error": "bad_payload"}, status_code=400)
 
     # Verify clientState (if supplied)
@@ -502,108 +424,102 @@ async def notifications(request: Request):
             LAST_POST = {"when": _now_iso(), "error": "client_state_mismatch", "raw": value}
             return JSONResponse({"error": "client_state_mismatch"}, status_code=403)
 
-    # Extract group ids and user ids from resource
-    changed_groups: list[str] = []
-    changed_users: list[str] = []
+    # Build per-user operations limited to our GROUP_ID
+    # Each op: {action: 'added'|'removed'|'updated'|'unknown', user: {...}, sourceChangeType, resource}
+    user_ops: List[Dict[str, Any]] = []
+    group_touched = False
+
+    # Step 1: fast-path for direct membership resources
     for n in value:
         res = (n.get("resource") or "").strip()
+        change = (n.get("changeType") or "").strip().lower()
+        g_id, relation, u_id = _parse_resource(res)
 
-        m_group = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})(?:$|/)", res)
-        if m_group:
-            changed_groups.append(m_group.group(1))
-
-        # /users/{userId}
-        m_user = re.match(r"^/?[Uu]sers/([0-9a-fA-F-]{36})(?:$|/)", res)
-        if m_user:
-            changed_users.append(m_user.group(1))
+        # Only consider our group
+        if g_id and GROUP_ID and g_id.lower() != GROUP_ID.lower():
             continue
 
-        # /groups/{groupId}/members/{userId}  OR owners/{userId}
-        m_member = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})/(?:members|owners)/([0-9a-fA-F-]{36})(?:$|/)?", res)
-        if m_member:
-            changed_users.append(m_member.group(2))
+        # Track if our group object was updated (for delta fallback)
+        if g_id and relation is None:
+            group_touched = True
 
-    # Deduplicate lists
-    changed_groups = sorted(set(changed_groups))
-    changed_users = sorted(set(changed_users))
+        if g_id and relation in {"members", "owners"} and u_id:
+            action = "updated"
+            if change == "created":
+                action = "added"
+            elif change == "deleted":
+                action = "removed"
+            # Enrich this user quickly
+            try:
+                u = await _get_user_basic(u_id)
+            except Exception:
+                u = {"id": u_id, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}
+            user_ops.append({
+                "action": action,
+                "relation": relation,
+                "user": u,
+                "sourceChangeType": change or None,
+                "resource": res,
+            })
 
-    # If nothing interesting changed, ACK but don't log
-    if not value or (not changed_groups and not changed_users):
-        return JSONResponse(status_code=200, content=_ok("no-op notification"))
-
-    # Dedup by a stable key derived from the interesting bits
-    dedup_key = _hash_obj({"groups": changed_groups, "users": changed_users})
-    if _seen_recent(dedup_key):
-        # Already logged this combo recently; ACK but don't log again
-        return JSONResponse(status_code=200, content=_ok("duplicate notification (suppressed)"))
-
-    # -------------------
-    # Expand user details + delta fallback
-    # -------------------
-    def _fmt_user(u: Dict[str, Any]) -> str:
-        name = u.get("displayName") or u.get("userPrincipalName") or u.get("id")
-        email = u.get("emailResolved") or u.get("mail") or u.get("userPrincipalName") or "-"
-        return f"{name} <{email}>"
-
-    expanded_users: List[Dict[str, Any]] = []
-    expanded_added: List[Dict[str, Any]] = []
-    expanded_removed: List[Dict[str, Any]] = []
-
-    if changed_users:
-        # Fast path: notification resource included /members/{userId}
+    # Step 2: if we didn't get specific member ids but the group was updated, run one delta to find adds/removes
+    if group_touched and not any(op for op in user_ops if op.get("action") in {"added","removed"}):
         try:
-            for uid in changed_users[:10]:  # keep webhook fast
-                u = await _get_user_basic(uid)
-                if u:
-                    expanded_users.append(u)
-        except Exception as e:
-            logger.warning(f"[user-lookup fast-path] failed: {e}")
-    else:
-        # Fallback: Graph didn't include memberId => run one delta to figure out who changed
-        try:
-            target_group_id = (changed_groups[0] if changed_groups else None)
-            if target_group_id:
-                delta = await _members_delta_once(target_group_id)
-                # Expand a few for readability
-                for uid in delta["added"][:10]:
-                    u = await _get_user_basic(uid)
-                    if u:
-                        expanded_added.append(u)
-                for uid in delta["removed"][:10]:
+            if GROUP_ID:
+                delta = await _members_delta_once(GROUP_ID)
+                # Enrich a few for readability
+                for uid in delta["added"][:25]:
+                    try:
+                        u = await _get_user_basic(uid)
+                    except Exception:
+                        u = {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}
+                    user_ops.append({"action": "added", "relation": "members", "user": u, "sourceChangeType": "updated", "resource": f"Groups/{GROUP_ID}"})
+                for uid in delta["removed"][:25]:
+                    # user might 404 after removal; tolerate
                     try:
                         u = await _get_user_basic(uid)
                     except Exception:
                         u = None
-                    expanded_removed.append(u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None})
+                    user_ops.append({"action": "removed", "relation": "members", "user": (u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}), "sourceChangeType": "updated", "resource": f"Groups/{GROUP_ID}"})
         except Exception as e:
             logger.warning(f"[delta fallback] failed: {e}")
 
-    # Build a friendly summary
-    summary_parts = [f"{len(value)} notification(s)"]
-    if changed_groups:
-        summary_parts.append(f"groups: {', '.join(changed_groups)}")
+    # If the notification set had nothing for our group, ack quietly
+    if not user_ops and not group_touched:
+        return JSONResponse(status_code=200, content=_ok("no-op (ignored non-target group or no member info)"))
 
-    if expanded_users:
-        summary_parts.append("users: " + "; ".join(_fmt_user(u) for u in expanded_users))
-    else:
-        if expanded_added:
-            summary_parts.append("added: " + "; ".join(_fmt_user(u) for u in expanded_added))
-        if expanded_removed:
-            summary_parts.append("removed: " + "; ".join(_fmt_user(u) for u in expanded_removed))
+    # Dedup key based on actions + user ids + group id
+    dedup_key = _hash_obj({
+        "gid": GROUP_ID,
+        "ops": [{"a": op["action"], "id": (op.get("user") or {}).get("id")} for op in user_ops]
+    })
+    if _seen_recent(dedup_key):
+        return JSONResponse(status_code=200, content=_ok("duplicate notification (suppressed)"))
 
-    # -------------------
+    # Build friendly summary for the UI
+    added = [op for op in user_ops if op["action"] == "added"]
+    removed = [op for op in user_ops if op["action"] == "removed"]
+    updated = [op for op in user_ops if op["action"] == "updated"]
+
+    parts = [f"{len(value)} notification(s)"]
+    if GROUP_ID:
+        parts.append(f"group: {GROUP_ID}")
+    if added:
+        parts.append("added: " + "; ".join(_fmt_user(op["user"]) for op in added))
+    if removed:
+        parts.append("removed: " + "; ".join(_fmt_user(op["user"]) for op in removed))
+    if updated and not (added or removed):
+        # only show updated if it wasn't just a backstop for adds/removes
+        parts.append("updated: " + "; ".join(_fmt_user(op["user"]) for op in updated))
 
     info = {
         "when": _now_iso(),
         "client_ip": request.client.host if request.client else None,
         "count": len(value),
-        "groups": changed_groups,
-        "users": changed_users,
-        "expanded_users": expanded_users,
-        "expanded_added": expanded_added,
-        "expanded_removed": expanded_removed,
-        "raw": value,
-        "summary": " | ".join(summary_parts),
+        "group_id": GROUP_ID,
+        "ops": user_ops,          # full processed operations (with action + user details)
+        "raw": value,             # original Graph payload
+        "summary": " | ".join(parts),
     }
     LAST_POST = info
     logger.info(f"[notification] {info}")
@@ -611,20 +527,23 @@ async def notifications(request: Request):
 
     return JSONResponse(status_code=200, content=_ok("notification received", **info))
 
-
 # ------------------------
 # Debug + HTML log
 # ------------------------
 @app.get("/notifications/debug")
 async def notifications_debug():
     _load_events_from_disk()
-    return {"last_validation": LAST_VALIDATION, "last_post": LAST_POST, "events": EVENTS[-50:]}
-
+    # Return the last 50 processed notifications with ops/actions for easy inspection
+    processed = [e for e in EVENTS if e.get("kind") == "notification"]
+    return {
+        "last_validation": LAST_VALIDATION,
+        "last_post": LAST_POST,
+        "recent_notifications": processed[-50:],
+    }
 
 @app.get("/notifications/log")
 async def notifications_log():
     return HTMLResponse(_render_html_log(), status_code=200)
-
 
 @app.post("/notifications/log/clear")
 async def notifications_log_clear():

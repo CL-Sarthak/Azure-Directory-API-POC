@@ -1,5 +1,5 @@
 # scripts/create_subscription_users.py
-import os, re, sys, json, datetime, requests, urllib.parse
+import os, sys, json, datetime, requests, urllib.parse
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
@@ -8,23 +8,17 @@ TENANT_ID     = os.environ["TENANT_ID"]
 CLIENT_ID     = os.environ["CLIENT_ID"]
 CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 
-RAW_URL          = (os.environ["NOTIFICATION_URL"] or "").strip()
-CLIENT_STATE     = os.getenv("CLIENT_STATE", "").strip()
-GROUP_ID         = os.getenv("GROUP_ID", "").strip()            # REQUIRED for membership-only
-RESOURCE         = os.getenv("RESOURCE", "").strip()            # optional: overrides everything (ignored when MEMBERSHIP=true)
-MEMBERSHIP       = os.getenv("MEMBERSHIP", "true").strip().lower() in {"1","true","yes"}  # default true
-LIFECYCLE_URL    = os.getenv("LIFECYCLE_URL", "").strip()
-LATEST_TLS       = os.getenv("LATEST_TLS", "v1_2").strip()      # v1_0|v1_1|v1_2|v1_3
-CHANGE_TYPES     = os.getenv("CHANGE_TYPES", "created,updated,deleted").strip()
-SUB_MINUTES      = int(os.getenv("SUB_MINUTES", "4230"))        # ≈2.94 days max for directory resources
+RAW_URL       = (os.environ["NOTIFICATION_URL"] or "").strip()
+CLIENT_STATE  = os.getenv("CLIENT_STATE", "").strip()
+GROUP_ID      = os.getenv("GROUP_ID", "").strip()  # REQUIRED: 70152fd3-14b9-4363-aa50-2ae1f30462d4
+LATEST_TLS    = os.getenv("LATEST_TLS", "v1_2").strip()
+SUB_MINUTES   = int(os.getenv("SUB_MINUTES", "4230"))  # max for directory resources
+LIFECYCLE_URL = os.getenv("LIFECYCLE_URL", "").strip()
 
-# Optional rich notifications (encrypted resource data). Leave off unless you’ve set these.
-WITH_RESOURCE_DATA  = os.getenv("WITH_RESOURCE_DATA", "false").strip().lower() in {"1","true","yes"}
-ENCRYPTION_CERT_B64 = os.getenv("ENCRYPTION_CERT_BASE64", "").strip()
-ENCRYPTION_CERT_ID  = os.getenv("ENCRYPTION_CERT_ID", "").strip()
-
-# Optional: also subscribe to owners if you want those changes too
-INCLUDE_OWNERS = os.getenv("INCLUDE_OWNERS", "false").strip().lower() in {"1","true","yes"}
+# Do NOT use includeResourceData for group membership; Graph won't give you email there.
+WITH_RESOURCE_DATA  = False
+ENCRYPTION_CERT_B64 = ""
+ENCRYPTION_CERT_ID  = ""
 
 AUTH_URL   = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -65,81 +59,41 @@ def preflight_notification_url():
     except Exception as e:
         return False, None, str(e)
 
-def resource_path() -> str:
-    """
-    Primary resource selector. For this use-case we enforce membership changes.
-    """
-    # Membership-only enforcement
-    if MEMBERSHIP:
-        if not GROUP_ID:
-            raise ValueError("MEMBERSHIP=true requires GROUP_ID to be set (subscribe to a specific group's members).")
-        # Ignore conflicting RESOURCE when membership=true (safer)
-        if RESOURCE and RESOURCE.strip("/") != f"groups/{GROUP_ID}/members":
-            print("[warn] MEMBERSHIP=true: ignoring RESOURCE override; using /groups/{id}/members", file=sys.stderr)
-        return f"/groups/{GROUP_ID}/members"
-
-    # If membership is explicitly disabled, allow override (NOT recommended)
-    if RESOURCE:
-        return RESOURCE
-
-    if GROUP_ID:
-        print("[warn] MEMBERSHIP=false — subscribing to /groups/{id} (group object changes ONLY, NOT membership).", file=sys.stderr)
-        return f"/groups/{GROUP_ID}"
-
-    raise ValueError("To track membership changes, set MEMBERSHIP=true and specify GROUP_ID.")
-
-def resource_paths() -> list[str]:
-    """
-    Return one or more resource paths to subscribe to.
-    Always includes members; optionally owners.
-    """
-    base = resource_path()  # usually /groups/{id}/members
-    paths = [base]
-    if INCLUDE_OWNERS:
-        grp = GROUP_ID or re.search(r"/groups/([0-9a-fA-F-]{36})", base).group(1)
-        paths.append(f"/groups/{grp}/owners")
-    return paths
-
 def expiry_iso(minutes: int) -> str:
     return (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
-def _build_payload():
+def base_payload() -> dict:
+    if not GROUP_ID:
+        raise ValueError("GROUP_ID is required.")
     payload = {
-        "changeType": CHANGE_TYPES,
         "notificationUrl": NOTIFICATION_URL,
-        "resource": resource_path(),  # will be overridden per-resource in ensure/create loop
         "expirationDateTime": expiry_iso(SUB_MINUTES),
         "clientState": CLIENT_STATE,
         "latestSupportedTlsVersion": LATEST_TLS,
     }
     if LIFECYCLE_URL:
         payload["lifecycleNotificationUrl"] = LIFECYCLE_URL
-
-    if WITH_RESOURCE_DATA:
-        if not ENCRYPTION_CERT_B64 or not ENCRYPTION_CERT_ID:
-            raise ValueError("WITH_RESOURCE_DATA=true requires ENCRYPTION_CERT_BASE64 and ENCRYPTION_CERT_ID")
-        payload["includeResourceData"] = True
-        payload["encryptionCertificate"] = ENCRYPTION_CERT_B64
-        payload["encryptionCertificateId"] = ENCRYPTION_CERT_ID
-
+    # includeResourceData is intentionally omitted for group membership
     return payload
 
-def create_subscription_for(res_path: str, token: str):
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = _build_payload()
-    payload["resource"] = res_path
+# Exactly TWO subscriptions we want for this one group:
+# 1) /groups/{gid}/members with created,deleted  → membership add/remove signals
+# 2) /groups/{gid} with updated                  → backstop; your webhook calls members/delta to learn who changed
+DESIRED = [
+    {"resource": lambda gid: f"/groups/{gid}/members", "changeType": "created,deleted"},
+    {"resource": lambda gid: f"/groups/{gid}",        "changeType": "updated"},
+]
 
+def create_subscription(resource: str, change_type: str, token: str):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = base_payload() | {"resource": resource, "changeType": change_type}
     print("[diag] Creating subscription with payload:")
     print(json.dumps(payload, indent=2))
-
     r = requests.post(f"{GRAPH_BASE}/subscriptions", headers=headers, json=payload, timeout=30)
     if r.status_code >= 400:
         print("[error]", r.status_code, r.text)
         if r.status_code == 400 and "ValidationError" in r.text:
-            print(
-                "[hint] Graph validates by sending a GET to ?validationToken=... on your notificationUrl. "
-                "Respond 200 text/plain with the raw token within 10s. Do NOT require auth on the validation GET."
-            )
+            print("[hint] Webhook must echo ?validationToken=<token> as 200 text/plain within 10s (no auth).")
         r.raise_for_status()
     sub = r.json()
     print("[ok] Created subscription:")
@@ -167,32 +121,47 @@ def renew_subscription(sub_id: str):
     except Exception:
         return {"id": sub_id, **body}
 
-def ensure_subscription():
+def ensure_only_for_group():
     ok, code, body = preflight_notification_url()
     print(f"[preflight] {NOTIFICATION_URL} ok={ok} status={code} body={body!r}")
     if not ok:
         print("[preflight] WARNING: webhook did not echo 200 text/plain; Graph validation may fail", file=sys.stderr)
 
     token = get_token()
-    subs = list_subscriptions(token)
+    existing = list_subscriptions(token)
 
-    def _matches(s, res):
-        if s.get("resource") != res: return False
-        if s.get("notificationUrl") != NOTIFICATION_URL: return False
-        if s.get("changeType") != CHANGE_TYPES: return False
-        if WITH_RESOURCE_DATA != bool(s.get("includeResourceData")): return False
-        return True
+    # Remove any unrelated subs that point to our webhook (e.g., /users)
+    headers = {"Authorization": f"Bearer {token}"}
+    for s in existing:
+        if s.get("notificationUrl") != NOTIFICATION_URL:
+            continue
+        res = s.get("resource", "")
+        if res not in {f"/groups/{GROUP_ID}", f"/groups/{GROUP_ID}/members"}:
+            sid = s.get("id")
+            if sid:
+                print(f"[cleanup] Deleting unrelated subscription {sid} resource={res}")
+                requests.delete(f"{GRAPH_BASE}/subscriptions/{sid}", headers=headers, timeout=30)
 
+    # Re-list after cleanup
+    existing = list_subscriptions(token)
+
+    # Ensure/renew the two desired subs
     results = []
-    for res in resource_paths():
-        match = next((s for s in subs if _matches(s, res)), None)
+    for spec in DESIRED:
+        res = spec["resource"](GROUP_ID)
+        ct  = spec["changeType"]
+        match = next((s for s in existing
+                      if s.get("notificationUrl")==NOTIFICATION_URL
+                      and s.get("resource")==res
+                      and s.get("changeType")==ct
+                      and not s.get("includeResourceData")), None)
         if match:
             exp = match.get("expirationDateTime")
             print(f"[diag] Found existing sub {match['id']} for {res} exp={exp}")
             try:
-                expires_at = datetime.datetime.fromisoformat((exp or "").replace("Z", "+00:00"))
+                expires_at = datetime.datetime.fromisoformat((exp or "").replace("Z","+00:00"))
                 delta = expires_at - datetime.datetime.now(datetime.UTC)
-                if delta.total_seconds() < 5 * 24 * 3600:
+                if delta.total_seconds() < 5*24*3600:
                     results.append(renew_subscription(match["id"]))
                 else:
                     print("[ok] Subscription still valid; no action")
@@ -200,42 +169,23 @@ def ensure_subscription():
             except Exception:
                 results.append(renew_subscription(match["id"]))
         else:
-            results.append(create_subscription_for(res, token))
+            results.append(create_subscription(res, ct, token))
     return results
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "create"
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "ensure"
     print("[diag] TENANT:", mask(TENANT_ID), "CLIENT:", mask(CLIENT_ID))
     print("[diag] NOTIFICATION_URL:", NOTIFICATION_URL)
-    try:
-        rp = resource_path()
-    except Exception as e:
-        print("[config error]", str(e))
-        sys.exit(2)
-    print("[diag] RESOURCE:", rp, "GROUP_ID:", GROUP_ID or "(n/a)")
-    print("[diag] CHANGE_TYPES:", CHANGE_TYPES, "EXPIRES_IN_MIN:", SUB_MINUTES, "TLS:", LATEST_TLS or "(default)")
-    print("[diag] WITH_RESOURCE_DATA:", WITH_RESOURCE_DATA)
-    print("[diag] INCLUDE_OWNERS:", INCLUDE_OWNERS)
-
+    print("[diag] GROUP_ID:", GROUP_ID or "(missing)")
+    print("[diag] TLS:", LATEST_TLS or "(default)")
     if cmd == "list":
         print(json.dumps({"value": list_subscriptions()}, indent=2))
     elif cmd == "ensure":
-        ensure_subscription()
+        ensure_only_for_group()
     elif cmd == "renew":
         subs = list_subscriptions()
-        # Renew the one(s) that match our current configuration
-        for res in resource_paths():
-            match = next((s for s in subs
-                          if s.get("resource")==res and s.get("notificationUrl")==NOTIFICATION_URL
-                          and s.get("changeType")==CHANGE_TYPES
-                          and bool(s.get("includeResourceData"))==WITH_RESOURCE_DATA), None)
-            if not match:
-                print(f"[renew] No matching subscription for {res}; creating new…")
-                create_subscription_for(res, get_token())
-            else:
-                renew_subscription(match["id"])
+        for s in subs:
+            if s.get("notificationUrl")==NOTIFICATION_URL and s.get("resource") in {f"/groups/{GROUP_ID}", f"/groups/{GROUP_ID}/members"}:
+                renew_subscription(s["id"])
     else:
-        # create for each desired resource
-        token = get_token()
-        for res in resource_paths():
-            create_subscription_for(res, token)
+        ensure_only_for_group()
