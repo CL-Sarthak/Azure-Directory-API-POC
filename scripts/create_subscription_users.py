@@ -1,5 +1,5 @@
 # scripts/create_subscription_users.py
-import os, sys, json, datetime, requests, urllib.parse
+import os, re, sys, json, datetime, requests, urllib.parse
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
@@ -11,18 +11,20 @@ CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 RAW_URL          = (os.environ["NOTIFICATION_URL"] or "").strip()
 CLIENT_STATE     = os.getenv("CLIENT_STATE", "").strip()
 GROUP_ID         = os.getenv("GROUP_ID", "").strip()            # REQUIRED for membership-only
-RESOURCE         = os.getenv("RESOURCE", "").strip()            # optional: overrides everything
+RESOURCE         = os.getenv("RESOURCE", "").strip()            # optional: overrides everything (ignored when MEMBERSHIP=true)
 MEMBERSHIP       = os.getenv("MEMBERSHIP", "true").strip().lower() in {"1","true","yes"}  # default true
 LIFECYCLE_URL    = os.getenv("LIFECYCLE_URL", "").strip()
 LATEST_TLS       = os.getenv("LATEST_TLS", "v1_2").strip()      # v1_0|v1_1|v1_2|v1_3
 CHANGE_TYPES     = os.getenv("CHANGE_TYPES", "created,updated,deleted").strip()
-# Directory resources (users/groups) max is ~4230 minutes; default to that to avoid 400s. (≈ 2.94 days)
-SUB_MINUTES      = int(os.getenv("SUB_MINUTES", "4230"))
+SUB_MINUTES      = int(os.getenv("SUB_MINUTES", "4230"))        # ≈2.94 days max for directory resources
 
 # Optional rich notifications (encrypted resource data). Leave off unless you’ve set these.
-WITH_RESOURCE_DATA       = os.getenv("WITH_RESOURCE_DATA", "false").strip().lower() in {"1","true","yes"}
-ENCRYPTION_CERT_B64      = os.getenv("ENCRYPTION_CERT_BASE64", "").strip()      # base64 DER or PEM sans headers
-ENCRYPTION_CERT_ID       = os.getenv("ENCRYPTION_CERT_ID", "").strip()
+WITH_RESOURCE_DATA  = os.getenv("WITH_RESOURCE_DATA", "false").strip().lower() in {"1","true","yes"}
+ENCRYPTION_CERT_B64 = os.getenv("ENCRYPTION_CERT_BASE64", "").strip()
+ENCRYPTION_CERT_ID  = os.getenv("ENCRYPTION_CERT_ID", "").strip()
+
+# Optional: also subscribe to owners if you want those changes too
+INCLUDE_OWNERS = os.getenv("INCLUDE_OWNERS", "false").strip().lower() in {"1","true","yes"}
 
 AUTH_URL   = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -64,33 +66,48 @@ def preflight_notification_url():
         return False, None, str(e)
 
 def resource_path() -> str:
-    # Explicit override wins
-    if RESOURCE:
-        return RESOURCE
-
+    """
+    Primary resource selector. For this use-case we enforce membership changes.
+    """
     # Membership-only enforcement
     if MEMBERSHIP:
         if not GROUP_ID:
             raise ValueError("MEMBERSHIP=true requires GROUP_ID to be set (subscribe to a specific group's members).")
-        # Subscribes specifically to membership relation changes (users/devices/SPs added/removed/updated)
+        # Ignore conflicting RESOURCE when membership=true (safer)
+        if RESOURCE and RESOURCE.strip("/") != f"groups/{GROUP_ID}/members":
+            print("[warn] MEMBERSHIP=true: ignoring RESOURCE override; using /groups/{id}/members", file=sys.stderr)
         return f"/groups/{GROUP_ID}/members"
 
-    # If someone disables MEMBERSHIP (not recommended for your use-case), we fallback to group object changes
+    # If membership is explicitly disabled, allow override (NOT recommended)
+    if RESOURCE:
+        return RESOURCE
+
     if GROUP_ID:
-        print("[warn] MEMBERSHIP=false — subscribing to /groups/{id} (group object changes ONLY, NOT membership).")
+        print("[warn] MEMBERSHIP=false — subscribing to /groups/{id} (group object changes ONLY, NOT membership).", file=sys.stderr)
         return f"/groups/{GROUP_ID}"
 
-    # Do NOT default to /groups (too broad + won’t tell you member changes)
     raise ValueError("To track membership changes, set MEMBERSHIP=true and specify GROUP_ID.")
+
+def resource_paths() -> list[str]:
+    """
+    Return one or more resource paths to subscribe to.
+    Always includes members; optionally owners.
+    """
+    base = resource_path()  # usually /groups/{id}/members
+    paths = [base]
+    if INCLUDE_OWNERS:
+        grp = GROUP_ID or re.search(r"/groups/([0-9a-fA-F-]{36})", base).group(1)
+        paths.append(f"/groups/{grp}/owners")
+    return paths
 
 def expiry_iso(minutes: int) -> str:
     return (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
 def _build_payload():
     payload = {
-        "changeType": CHANGE_TYPES,                  # created,updated,deleted (membership adds/removes/updates)
+        "changeType": CHANGE_TYPES,
         "notificationUrl": NOTIFICATION_URL,
-        "resource": resource_path(),
+        "resource": resource_path(),  # will be overridden per-resource in ensure/create loop
         "expirationDateTime": expiry_iso(SUB_MINUTES),
         "clientState": CLIENT_STATE,
         "latestSupportedTlsVersion": LATEST_TLS,
@@ -107,10 +124,10 @@ def _build_payload():
 
     return payload
 
-def create_subscription():
-    token = get_token()
+def create_subscription_for(res_path: str, token: str):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = _build_payload()
+    payload["resource"] = res_path
 
     print("[diag] Creating subscription with payload:")
     print(json.dumps(payload, indent=2))
@@ -158,31 +175,33 @@ def ensure_subscription():
 
     token = get_token()
     subs = list_subscriptions(token)
-    res  = resource_path()
 
-    def _matches(s):
+    def _matches(s, res):
         if s.get("resource") != res: return False
         if s.get("notificationUrl") != NOTIFICATION_URL: return False
         if s.get("changeType") != CHANGE_TYPES: return False
         if WITH_RESOURCE_DATA != bool(s.get("includeResourceData")): return False
         return True
 
-    match = next((s for s in subs if _matches(s)), None)
-
-    if match:
-        exp = match.get("expirationDateTime")
-        print(f"[diag] Found existing sub {match['id']} exp={exp}")
-        try:
-            expires_at = datetime.datetime.fromisoformat((exp or "").replace("Z", "+00:00"))
-            delta = expires_at - datetime.datetime.now(datetime.UTC)
-            if delta.total_seconds() < 5 * 24 * 3600:
-                return renew_subscription(match["id"])
-            print("[ok] Subscription still valid; no action")
-            return match
-        except Exception:
-            return renew_subscription(match["id"])
-    else:
-        return create_subscription()
+    results = []
+    for res in resource_paths():
+        match = next((s for s in subs if _matches(s, res)), None)
+        if match:
+            exp = match.get("expirationDateTime")
+            print(f"[diag] Found existing sub {match['id']} for {res} exp={exp}")
+            try:
+                expires_at = datetime.datetime.fromisoformat((exp or "").replace("Z", "+00:00"))
+                delta = expires_at - datetime.datetime.now(datetime.UTC)
+                if delta.total_seconds() < 5 * 24 * 3600:
+                    results.append(renew_subscription(match["id"]))
+                else:
+                    print("[ok] Subscription still valid; no action")
+                    results.append(match)
+            except Exception:
+                results.append(renew_subscription(match["id"]))
+        else:
+            results.append(create_subscription_for(res, token))
+    return results
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "create"
@@ -196,6 +215,7 @@ if __name__ == "__main__":
     print("[diag] RESOURCE:", rp, "GROUP_ID:", GROUP_ID or "(n/a)")
     print("[diag] CHANGE_TYPES:", CHANGE_TYPES, "EXPIRES_IN_MIN:", SUB_MINUTES, "TLS:", LATEST_TLS or "(default)")
     print("[diag] WITH_RESOURCE_DATA:", WITH_RESOURCE_DATA)
+    print("[diag] INCLUDE_OWNERS:", INCLUDE_OWNERS)
 
     if cmd == "list":
         print(json.dumps({"value": list_subscriptions()}, indent=2))
@@ -203,15 +223,19 @@ if __name__ == "__main__":
         ensure_subscription()
     elif cmd == "renew":
         subs = list_subscriptions()
-        res  = resource_path()
-        match = next((s for s in subs
-                      if s.get("resource")==res and s.get("notificationUrl")==NOTIFICATION_URL
-                      and s.get("changeType")==CHANGE_TYPES
-                      and bool(s.get("includeResourceData"))==WITH_RESOURCE_DATA), None)
-        if not match:
-            print("[renew] No matching subscription; creating new…")
-            create_subscription()
-        else:
-            renew_subscription(match["id"])
+        # Renew the one(s) that match our current configuration
+        for res in resource_paths():
+            match = next((s for s in subs
+                          if s.get("resource")==res and s.get("notificationUrl")==NOTIFICATION_URL
+                          and s.get("changeType")==CHANGE_TYPES
+                          and bool(s.get("includeResourceData"))==WITH_RESOURCE_DATA), None)
+            if not match:
+                print(f"[renew] No matching subscription for {res}; creating new…")
+                create_subscription_for(res, get_token())
+            else:
+                renew_subscription(match["id"])
     else:
-        create_subscription()
+        # create for each desired resource
+        token = get_token()
+        for res in resource_paths():
+            create_subscription_for(res, token)

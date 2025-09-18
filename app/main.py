@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 
-from fastapi import FastAPI, Request, status, Form
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, Response, PlainTextResponse, HTMLResponse
 from dotenv import load_dotenv
 
@@ -27,7 +27,7 @@ logger = logging.getLogger("uvicorn")
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL") or ""
 
-# ---- new: graph app creds for lookup ----
+# ---- graph app creds for lookup ----
 TENANT_ID = os.getenv("TENANT_ID") or ""
 CLIENT_ID = os.getenv("CLIENT_ID") or ""
 CLIENT_SECRET = os.getenv("CLIENT_SECRET") or ""
@@ -38,7 +38,7 @@ AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 LAST_VALIDATION: Optional[Dict[str, Any]] = None
 LAST_POST: Optional[Dict[str, Any]] = None
 
-# ---- new: persistent event log (memory + file) ----
+# ---- persistent event log (memory + file) ----
 EVENTS: List[Dict[str, Any]] = []
 LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")
 
@@ -64,11 +64,7 @@ def _now_iso():
 
 
 def _append_event(kind: str, data: Dict[str, Any]):
-    event = {
-        "ts": _now_iso(),
-        "kind": kind,
-        **data,
-    }
+    event = {"ts": _now_iso(), "kind": kind, **data}
     EVENTS.append(event)
     try:
         with LOG_PATH.open("a", encoding="utf-8") as f:
@@ -91,7 +87,6 @@ def _load_events_from_disk():
 
 
 def _hash_obj(o: Any) -> str:
-    # stable hash of the interesting payload (sort keys to normalize)
     j = json.dumps(o, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(j.encode("utf-8")).hexdigest()
 
@@ -172,7 +167,7 @@ def _render_html_log() -> str:
 </html>"""
 
 
-# ---- new: minimal Graph helper (app-only) ----
+# ---- minimal Graph helpers (app-only) ----
 async def _get_graph_token() -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
@@ -188,24 +183,57 @@ async def _get_graph_token() -> str:
         return resp.json()["access_token"]
 
 
+def _pick_primary_smtp(proxy_addrs: Optional[List[str]]) -> Optional[str]:
+    if not proxy_addrs:
+        return None
+    # Primary SMTP address is the one with uppercase "SMTP:"
+    primary = next((a for a in proxy_addrs if isinstance(a, str) and a.startswith("SMTP:")), None)
+    if primary:
+        return primary.split(":", 1)[1]
+    # Fallback: any smtp:
+    any_smtp = next((a for a in proxy_addrs if isinstance(a, str) and a.lower().startswith("smtp:")), None)
+    if any_smtp:
+        return any_smtp.split(":", 1)[1]
+    return None
+
+
+def _best_email(user: Dict[str, Any]) -> Optional[str]:
+    # Priority: mail → primary proxyAddress → first otherMails → UPN
+    return (
+        user.get("mail")
+        or _pick_primary_smtp(user.get("proxyAddresses"))
+        or (user.get("otherMails") or [None])[0]
+        or user.get("userPrincipalName")
+    )
+
+
 async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
     token = await _get_graph_token()
-    url = f"{GRAPH_BASE}/users/{user_id}?$select=id,displayName,mail,userPrincipalName"
+    url = (
+        f"{GRAPH_BASE}/users/{user_id}"
+        "?$select=id,displayName,mail,userPrincipalName,otherMails,proxyAddresses"
+    )
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if r.status_code == 404:
             return None
         r.raise_for_status()
         u = r.json()
-        return {
+        slim = {
             "id": u.get("id"),
             "displayName": u.get("displayName"),
             "mail": u.get("mail"),
             "userPrincipalName": u.get("userPrincipalName"),
+            "otherMails": u.get("otherMails") or [],
+            "proxyAddresses": u.get("proxyAddresses") or [],
         }
+        slim["emailResolved"] = _best_email(slim)
+        return slim
+
 
 # --- membership delta helpers (persist deltaLink so next call is incremental) ---
 DELTA_STATE_FILE = pathlib.Path("/tmp/members_delta_state.json")
+
 
 def _load_delta_state() -> Dict[str, Any]:
     try:
@@ -215,11 +243,13 @@ def _load_delta_state() -> Dict[str, Any]:
         logger.warning(f"[delta] load failed: {e}")
     return {}
 
+
 def _save_delta_state(state: Dict[str, Any]) -> None:
     try:
         DELTA_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         logger.warning(f"[delta] save failed: {e}")
+
 
 async def _members_delta_once(group_id: str) -> Dict[str, list]:
     """
@@ -346,21 +376,49 @@ async def graph_diag(raw: int = 0):
 
 
 # ------------------------
-# URL #2: Show all members of a group (live from Graph)
+# URL #2: Show all members of a group (live from Graph) with solid email resolution
 # ------------------------
 @app.get("/api/group/{group_id}/members")
 async def group_members(group_id: str):
     try:
-        members = g.list_group_members(group_id)
-        simplified = [
-            {
-                "id": m.get("id"),
-                "displayName": m.get("displayName"),
-                "mail": m.get("mail"),
-                "userPrincipalName": m.get("userPrincipalName"),
-            }
-            for m in members
-        ]
+        members = g.list_group_members(group_id)  # likely returns basic fields
+        simplified = []
+        missing_ids: List[str] = []
+
+        for m in members:
+            email = (
+                m.get("mail")
+                or _pick_primary_smtp(m.get("proxyAddresses"))
+                or (m.get("otherMails") or [None])[0]
+                or m.get("userPrincipalName")
+            )
+            if not email:
+                uid = m.get("id")
+                if uid:
+                    missing_ids.append(uid)
+            simplified.append(
+                {
+                    "id": m.get("id"),
+                    "displayName": m.get("displayName"),
+                    "mail": m.get("mail"),
+                    "userPrincipalName": m.get("userPrincipalName"),
+                    "emailResolved": email,
+                }
+            )
+
+        # Enrich entries that still don't have an email by querying Graph for those users
+        if missing_ids:
+            id_to_user: Dict[str, Dict[str, Any]] = {}
+            for uid in missing_ids[:50]:  # safety cap
+                u = await _get_user_basic(uid)
+                if u:
+                    id_to_user[uid] = u
+            for row in simplified:
+                if not row.get("emailResolved"):
+                    u = id_to_user.get(row.get("id"))
+                    if u:
+                        row["emailResolved"] = u.get("emailResolved")
+
         return JSONResponse(status_code=status.HTTP_200_OK, content={"count": len(simplified), "members": simplified})
     except httpx.HTTPStatusError as e:
         return JSONResponse(
@@ -460,7 +518,7 @@ async def notifications(request: Request):
             changed_users.append(m_user.group(1))
             continue
 
-        # /groups/{groupId}/members/{userId}
+        # /groups/{groupId}/members/{userId}  OR owners/{userId}
         m_member = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})/(?:members|owners)/([0-9a-fA-F-]{36})(?:$|/)?", res)
         if m_member:
             changed_users.append(m_member.group(2))
@@ -484,8 +542,8 @@ async def notifications(request: Request):
     # -------------------
     def _fmt_user(u: Dict[str, Any]) -> str:
         name = u.get("displayName") or u.get("userPrincipalName") or u.get("id")
-        mail = u.get("mail") or "-"
-        return f"{name} <{mail}>"
+        email = u.get("emailResolved") or u.get("mail") or u.get("userPrincipalName") or "-"
+        return f"{name} <{email}>"
 
     expanded_users: List[Dict[str, Any]] = []
     expanded_added: List[Dict[str, Any]] = []
@@ -509,13 +567,14 @@ async def notifications(request: Request):
                 # Expand a few for readability
                 for uid in delta["added"][:10]:
                     u = await _get_user_basic(uid)
-                    if u: expanded_added.append(u)
+                    if u:
+                        expanded_added.append(u)
                 for uid in delta["removed"][:10]:
                     try:
                         u = await _get_user_basic(uid)
                     except Exception:
                         u = None
-                    expanded_removed.append(u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None})
+                    expanded_removed.append(u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None})
         except Exception as e:
             logger.warning(f"[delta fallback] failed: {e}")
 
