@@ -34,8 +34,17 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET") or ""
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 
-# Target group (we only log events for this one)
+# Target groups (prefer GROUP_IDS, fallback to GROUP_ID for back-compat)
+_GROUP_IDS_RAW = (os.getenv("GROUP_IDS") or "").strip()
+GROUP_IDS = [g.strip() for g in _GROUP_IDS_RAW.split(",") if g.strip()]
 GROUP_ID = (os.getenv("GROUP_ID") or "").strip()
+if not GROUP_IDS and GROUP_ID:
+    GROUP_IDS = [GROUP_ID]
+
+def _is_allowed_group(gid: str | None) -> bool:
+    if not gid:
+        return False
+    return any(gid.lower() == g.lower() for g in GROUP_IDS)
 
 # ---- lightweight in-app debug state ----
 LAST_VALIDATION: Optional[Dict[str, Any]] = None
@@ -46,7 +55,8 @@ EVENTS: List[Dict[str, Any]] = []
 LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")
 
 # ---- log behavior toggles ----
-LOG_AUTO_REFRESH_SECS = int(os.getenv("LOG_AUTO_REFRESH_SECS", "0"))  # 0 = no auto-refresh
+# Hard-set to NO auto-refresh from the API (user refreshes manually)
+LOG_AUTO_REFRESH_SECS = 0
 LOG_INCLUDE_VALIDATIONS = (os.getenv("LOG_INCLUDE_VALIDATIONS", "false").lower() == "true")
 LOG_DEDUP_WINDOW = int(os.getenv("LOG_DEDUP_WINDOW", "300"))  # seconds to keep recent keys for dedup
 
@@ -105,7 +115,7 @@ def _seen_recent(key: str) -> bool:
     return False
 
 # ------------------------
-# HTML log renderer (kept same look)
+# HTML log renderer (no auto-refresh)
 # ------------------------
 def _render_html_log() -> str:
     _load_events_from_disk()
@@ -143,14 +153,13 @@ def _render_html_log() -> str:
         """)
     body = "\n".join(rows) or "<p>No events yet.</p>"
 
-    refresh_tag = f'<meta http-equiv="refresh" content="{LOG_AUTO_REFRESH_SECS}" />' if LOG_AUTO_REFRESH_SECS > 0 else ""
-    footer_text = f"Auto-refreshing every {LOG_AUTO_REFRESH_SECS}s" if LOG_AUTO_REFRESH_SECS > 0 else "Auto-refresh off (press ⟳)"
+    # No meta refresh tag
+    footer_text = "Auto-refresh off (press ⟳)"
 
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  {refresh_tag}
   <title>Graph Notifications Log</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
 </head>
@@ -299,7 +308,7 @@ async def root():
         notification_url=NOTIFICATION_URL,
         tenant_masked=_mask(os.getenv("TENANT_ID") or ""),
         client_masked=_mask(os.getenv("CLIENT_ID") or ""),
-        group_id=GROUP_ID or "(not set)"
+        group_ids=GROUP_IDS or ["(not set)"]
     )
 
 @app.get("/api/graph/diag")
@@ -310,7 +319,7 @@ async def graph_diag():
         "secret_present": bool(os.getenv("CLIENT_SECRET")),
         "tenant_masked": _mask(os.getenv("TENANT_ID") or ""),
         "client_masked": _mask(os.getenv("CLIENT_ID") or ""),
-        "group_id": GROUP_ID or "(not set)",
+        "group_ids": GROUP_IDS or ["(not set)"],
     }
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
         return JSONResponse(
@@ -390,7 +399,7 @@ def _is_removed_marker(v: Any) -> bool:
 
 # ------------------------
 # Core: Graph change notifications (POST)
-#   - Only logs events for GROUP_ID
+#   - Logs events for any configured GROUP_IDS
 #   - Emits per-user ops with action + email/name
 #   - Understands resourceData["members@delta"] (added/removed)
 # ------------------------
@@ -431,9 +440,9 @@ async def notifications(request: Request):
             LAST_POST = {"when": _now_iso(), "error": "client_state_mismatch", "raw": value}
             return JSONResponse({"error": "client_state_mismatch"}, status_code=403)
 
-    # Build per-user operations limited to our GROUP_ID
+    # Build per-user operations limited to our GROUP_IDS
     user_ops: List[Dict[str, Any]] = []
-    group_touched = False
+    touched_groups: set[str] = set()
 
     # Step 1: fast-path for direct membership resources + members@delta
     for n in value:
@@ -441,13 +450,13 @@ async def notifications(request: Request):
         change = (n.get("changeType") or "").strip().lower()
         g_id, relation, u_id = _parse_resource(res)
 
-        # Only consider our group
-        if g_id and GROUP_ID and g_id.lower() != GROUP_ID.lower():
+        # Only consider allowed groups (if present on this notification)
+        if g_id and not _is_allowed_group(g_id):
             continue
 
         # Track if our group object was updated (for delta fallback)
-        if g_id and relation is None:
-            group_touched = True
+        if g_id and relation is None and _is_allowed_group(g_id):
+            touched_groups.add(g_id)
 
         # Handle direct members/owners resource form
         if g_id and relation in {"members", "owners"} and u_id:
@@ -470,15 +479,15 @@ async def notifications(request: Request):
 
         # Robustly handle resourceData.members@delta
         rd = n.get("resourceData") or {}
-        # Confirm this is our target group via resourceData.id
+        # Confirm this is one of our target groups via resourceData.id
         rd_gid = (rd.get("id") or "").strip()
-        if rd_gid and GROUP_ID and rd_gid.lower() == GROUP_ID.lower():
+        if rd_gid and _is_allowed_group(rd_gid):
             members_delta = rd.get("members@delta")
             if isinstance(members_delta, dict) and "value" in members_delta:
                 # Some tenants shape it as {'value':[...]}
                 members_delta = members_delta.get("value")
             if isinstance(members_delta, list) and members_delta:
-                group_touched = True  # definitely a membership change on our group
+                touched_groups.add(rd_gid)  # definitely a membership change
                 for item in members_delta:
                     uid = item.get("id")
                     if not uid:
@@ -495,37 +504,37 @@ async def notifications(request: Request):
                         "relation": "members",
                         "user": (u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}),
                         "sourceChangeType": change or None,
-                        "resource": res or f"Groups/{GROUP_ID}",
+                        "resource": res or f"Groups/{rd_gid}",
                     })
 
-    # Step 2: if we still didn't get specific member ids but the group was updated, run one delta to find adds/removes
-    if group_touched and not any(op for op in user_ops if op.get("action") in {"added","removed"}):
+    # Step 2: if we still didn't get specific member ids but some groups were updated, run one delta per touched group
+    if touched_groups and not any(op for op in user_ops if op.get("action") in {"added", "removed"}):
         try:
-            if GROUP_ID:
-                delta = await _members_delta_once(GROUP_ID)
+            for tg in list(touched_groups)[:10]:  # cap to be safe
+                delta = await _members_delta_once(tg)
                 for uid in delta["added"][:25]:
                     try:
                         u = await _get_user_basic(uid)
                     except Exception:
                         u = {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}
-                    user_ops.append({"action": "added", "relation": "members", "user": u, "sourceChangeType": "updated", "resource": f"Groups/{GROUP_ID}"})
+                    user_ops.append({"action": "added", "relation": "members", "user": u, "sourceChangeType": "updated", "resource": f"Groups/{tg}"})
                 for uid in delta["removed"][:25]:
                     try:
                         u = await _get_user_basic(uid)
                     except Exception:
                         u = None
-                    user_ops.append({"action": "removed", "relation": "members", "user": (u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}), "sourceChangeType": "updated", "resource": f"Groups/{GROUP_ID}"})
+                    user_ops.append({"action": "removed", "relation": "members", "user": (u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}), "sourceChangeType": "updated", "resource": f"Groups/{tg}"})
         except Exception as e:
             logger.warning(f"[delta fallback] failed: {e}")
 
-    # If the notification set had nothing for our group, ack quietly
-    if not user_ops and not group_touched:
+    # If the notification set had nothing for our groups, ack quietly
+    if not user_ops and not touched_groups:
         return JSONResponse(status_code=200, content=_ok("no-op (ignored non-target group or no member info)"))
 
-    # Dedup key based on actions + user ids + group id
+    # Dedup key based on actions + user ids + resource per op + configured groups
     dedup_key = _hash_obj({
-        "gid": GROUP_ID,
-        "ops": [{"a": op["action"], "id": (op.get("user") or {}).get("id")} for op in user_ops]
+        "gids": sorted(GROUP_IDS),
+        "ops": [{"a": op["action"], "id": (op.get("user") or {}).get("id"), "res": op.get("resource")} for op in user_ops]
     })
     if _seen_recent(dedup_key):
         return JSONResponse(status_code=200, content=_ok("duplicate notification (suppressed)"))
@@ -538,8 +547,8 @@ async def notifications(request: Request):
     def _fmt(op): return _fmt_user(op["user"])
 
     parts = [f"{len(value)} notification(s)"]
-    if GROUP_ID:
-        parts.append(f"group: {GROUP_ID}")
+    if touched_groups:
+        parts.append("groups: " + ", ".join(sorted(touched_groups)))
     if added:
         parts.append("added: " + "; ".join(_fmt(op) for op in added))
     if removed:
@@ -551,7 +560,7 @@ async def notifications(request: Request):
         "when": _now_iso(),
         "client_ip": request.client.host if request.client else None,
         "count": len(value),
-        "group_id": GROUP_ID,
+        "group_ids": GROUP_IDS,
         "ops": user_ops,          # full processed operations (with action + user details)
         "raw": value,             # original Graph payload
         "summary": " | ".join(parts),
