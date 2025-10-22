@@ -15,60 +15,47 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, Response, PlainTextResponse, HTMLResponse
 from dotenv import load_dotenv
 
-# Load .env once at startup
 load_dotenv()
 
-# ------------------------
-# App + config
-# ------------------------
 app = FastAPI(title="Azure AD Webhook + Graph POC")
 logger = logging.getLogger("uvicorn")
 
+# --- Config ---
 CLIENT_STATE = (os.getenv("CLIENT_STATE") or "").strip()
 NOTIFICATION_URL = os.getenv("NOTIFICATION_URL") or ""
 
-# Graph app creds
 TENANT_ID = os.getenv("TENANT_ID") or ""
 CLIENT_ID = os.getenv("CLIENT_ID") or ""
 CLIENT_SECRET = os.getenv("CLIENT_SECRET") or ""
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 
-# Target groups (prefer GROUP_IDS, fallback to GROUP_ID for back-compat)
 _GROUP_IDS_RAW = (os.getenv("GROUP_IDS") or "").strip()
 GROUP_IDS = [g.strip() for g in _GROUP_IDS_RAW.split(",") if g.strip()]
 GROUP_ID = (os.getenv("GROUP_ID") or "").strip()
 if not GROUP_IDS and GROUP_ID:
     GROUP_IDS = [GROUP_ID]
 
-def _is_allowed_group(gid: str | None) -> bool:
+def _is_allowed_group(gid: Optional[str]) -> bool:
     if not gid:
         return False
     return any(gid.lower() == g.lower() for g in GROUP_IDS)
 
-# ---- lightweight in-app debug state ----
+# --- In-memory state + simple file log ---
 LAST_VALIDATION: Optional[Dict[str, Any]] = None
 LAST_POST: Optional[Dict[str, Any]] = None
 
-# ---- persistent event log (memory + file) ----
 EVENTS: List[Dict[str, Any]] = []
 LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")
 
-# ---- log behavior toggles ----
-# Hard-set to NO auto-refresh from the API (user refreshes manually)
-LOG_AUTO_REFRESH_SECS = 0
 LOG_INCLUDE_VALIDATIONS = (os.getenv("LOG_INCLUDE_VALIDATIONS", "false").lower() == "true")
 LOG_DEDUP_WINDOW = int(os.getenv("LOG_DEDUP_WINDOW", "300"))  # seconds to keep recent keys for dedup
-
-# ---- dedup state ----
 _RECENT_KEYS: deque[tuple[str, float]] = deque(maxlen=500)  # (key, ts)
 
-# ---- delta state file (for /members/delta)
+# Per-group delta cursor storage
 DELTA_STATE_FILE = pathlib.Path("/tmp/members_delta_state.json")
 
-# ------------------------
-# Utility helpers
-# ------------------------
+# --- Small helpers ---
 def _mask(v: str) -> str:
     return f"{v[:4]}…{v[-4:]}" if v and len(v) > 8 else v or "(empty)"
 
@@ -105,7 +92,6 @@ def _hash_obj(o: Any) -> str:
 
 def _seen_recent(key: str) -> bool:
     now = datetime.now(timezone.utc).timestamp()
-    # prune expired
     while _RECENT_KEYS and (now - _RECENT_KEYS[0][1]) > LOG_DEDUP_WINDOW:
         _RECENT_KEYS.popleft()
     for k, _ts in _RECENT_KEYS:
@@ -114,9 +100,6 @@ def _seen_recent(key: str) -> bool:
     _RECENT_KEYS.append((key, now))
     return False
 
-# ------------------------
-# HTML log renderer (no auto-refresh)
-# ------------------------
 def _render_html_log() -> str:
     _load_events_from_disk()
     rows = []
@@ -153,7 +136,6 @@ def _render_html_log() -> str:
         """)
     body = "\n".join(rows) or "<p>No events yet.</p>"
 
-    # No meta refresh tag
     footer_text = "Auto-refresh off (press ⟳)"
 
     return f"""<!doctype html>
@@ -179,9 +161,7 @@ def _render_html_log() -> str:
 </body>
 </html>"""
 
-# ------------------------
-# Graph helpers (+ tiny in-proc cache)
-# ------------------------
+# --- Graph helpers ---
 async def _get_graph_token() -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
@@ -195,53 +175,6 @@ async def _get_graph_token() -> str:
         )
         resp.raise_for_status()
         return resp.json()["access_token"]
-
-def _pick_primary_smtp(proxy_addrs: Optional[List[str]]) -> Optional[str]:
-    if not proxy_addrs:
-        return None
-    primary = next((a for a in proxy_addrs if isinstance(a, str) and a.startswith("SMTP:")), None)
-    if primary:
-        return primary.split(":", 1)[1]
-    any_smtp = next((a for a in proxy_addrs if isinstance(a, str) and a.lower().startswith("smtp:")), None)
-    if any_smtp:
-        return any_smtp.split(":", 1)[1]
-    return None
-
-def _best_email(user: Dict[str, Any]) -> Optional[str]:
-    return (
-        user.get("mail")
-        or _pick_primary_smtp(user.get("proxyAddresses"))
-        or (user.get("otherMails") or [None])[0]
-        or user.get("userPrincipalName")
-    )
-
-_USER_CACHE: Dict[str, Dict[str, Any]] = {}
-
-async def _get_user_basic(user_id: str) -> Optional[Dict[str, Any]]:
-    if user_id in _USER_CACHE:
-        return _USER_CACHE[user_id]
-    token = await _get_graph_token()
-    url = (
-        f"{GRAPH_BASE}/users/{user_id}"
-        "?$select=id,displayName,mail,userPrincipalName,otherMails,proxyAddresses"
-    )
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        u = r.json()
-        slim = {
-            "id": u.get("id"),
-            "displayName": u.get("displayName"),
-            "mail": u.get("mail"),
-            "userPrincipalName": u.get("userPrincipalName"),
-            "otherMails": u.get("otherMails") or [],
-            "proxyAddresses": u.get("proxyAddresses") or [],
-        }
-        slim["emailResolved"] = _best_email(slim)
-        _USER_CACHE[user_id] = slim
-        return slim
 
 def _load_delta_state() -> Dict[str, Any]:
     try:
@@ -259,14 +192,15 @@ def _save_delta_state(state: Dict[str, Any]) -> None:
 
 async def _members_delta_once(group_id: str) -> Dict[str, list]:
     """
-    One delta sweep for the group's members.
+    One delta sweep for the group's direct members.
     Returns {'added': [userIds], 'removed': [userIds]} and stores deltaLink for next time.
-    NOTE: the very first call (no prior deltaLink) returns a baseline (no adds/removes).
+    The very first call (no prior deltaLink) returns a baseline (no adds/removes).
     """
     state = _load_delta_state()
     prev = state.get(group_id, {}).get("deltaLink")
 
     token = await _get_graph_token()
+    # Using members delta for direct membership tracking.
     url = prev or f"{GRAPH_BASE}/groups/{group_id}/members/delta?$select=id&$top=999"
 
     added, removed = set(), set()
@@ -298,9 +232,7 @@ async def _members_delta_once(group_id: str) -> Dict[str, list]:
 
     return {"added": sorted(added), "removed": sorted(removed)}
 
-# ------------------------
-# Root + diag
-# ------------------------
+# --- Routing ---
 @app.get("/")
 async def root():
     return _ok(
@@ -328,11 +260,9 @@ async def graph_diag():
         )
     return JSONResponse(status_code=200, content={"status": "OK", "message": "Graph creds present", **diag})
 
-# ------------------------
-# Graph handshake (GET) — records GET validations
-# ------------------------
+# Validation echo (GET)
 @app.get("/notifications")
-async def validate(request: Request, validationToken: str | None = None):
+async def validate(request: Request, validationToken: Optional[str] = None):
     global LAST_VALIDATION
     if validationToken:
         info = {
@@ -349,34 +279,22 @@ async def validate(request: Request, validationToken: str | None = None):
         return PlainTextResponse(validationToken, status_code=200)
     return Response(status_code=204)
 
-# ------------------------
-# Helpers for notification parsing
-# ------------------------
-def _parse_resource(res: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Return (groupId, relation, userId) from resource string.
-    Examples:
-      Groups/{G}
-      Groups/{G}/members/{U}
-      Groups/{G}/owners/{U}
-      Users/{U}  -> (None, None, U)
-    """
+# Parse resource like:
+#   Groups/{G}/members
+#   Groups/{G}/members/{U}
+#   Groups/{G}/members/$ref
+def _parse_resource(res: str) -> Tuple[Optional[str], Optional[str]]:
     if not res:
-        return None, None, None
-
-    m_member = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})/(members|owners)/([0-9a-fA-F-]{36})(?:$|/)", res)
-    if m_member:
-        return m_member.group(1), m_member.group(2), m_member.group(3)
-
-    m_group = re.match(r"^/?[Gg]roups/([0-9a-fA-F-]{36})(?:$|/)", res)
-    if m_group:
-        return m_group.group(1), None, None
-
-    m_user = re.match(r"^/?[Uu]sers/([0-9a-fA-F-]{36})(?:$|/)", res)
-    if m_user:
-        return None, None, m_user.group(1)
-
-    return None, None, None
+        return None, None
+    m = re.match(
+        r"^/?[Gg]roups/([0-9a-fA-F-]{36})/members(?:/([0-9a-fA-F-]{36}))?(?:/\$ref)?(?:$|/)",
+        res,
+    )
+    if m:
+        gid = m.group(1)
+        uid = m.group(2) if len(m.groups()) >= 2 else None
+        return gid, uid
+    return None, None
 
 def _fmt_user(u: Dict[str, Any]) -> str:
     name = u.get("displayName") or u.get("userPrincipalName") or u.get("id")
@@ -384,11 +302,6 @@ def _fmt_user(u: Dict[str, Any]) -> str:
     return f"{name} <{email}>"
 
 def _is_removed_marker(v: Any) -> bool:
-    """
-    Accept both Graph shapes:
-      "@removed": "deleted"
-      "@removed": {"reason": "deleted"}
-    """
     if v is None:
         return False
     if isinstance(v, str):
@@ -397,16 +310,12 @@ def _is_removed_marker(v: Any) -> bool:
         return (v.get("reason") or "").lower() == "deleted"
     return False
 
-# ------------------------
-# Core: Graph change notifications (POST)
-#   - Logs events for any configured GROUP_IDS
-#   - Emits per-user ops with action + email/name
-#   - Understands resourceData["members@delta"] (added/removed)
-# ------------------------
+# Notification receiver (POST)
 @app.post("/notifications")
 async def notifications(request: Request):
     global LAST_POST, LAST_VALIDATION
 
+    # POST validation echo support (some hosts route validation as POST)
     token = request.query_params.get("validationToken")
     if token:
         info = {
@@ -422,6 +331,7 @@ async def notifications(request: Request):
             _append_event("validation-post", {"client_ip": info["client_ip"], "summary": "POST validation", "raw": {"validationToken": token}, **info})
         return PlainTextResponse(token, status_code=200)
 
+    # Parse body
     try:
         body = await request.json()
     except Exception:
@@ -433,105 +343,71 @@ async def notifications(request: Request):
         LAST_POST = {"when": _now_iso(), "error": "bad_payload", "raw": body}
         return JSONResponse({"error": "bad_payload"}, status_code=400)
 
-    # Verify clientState (if supplied)
+    # Verify clientState if provided
     for n in value:
         incoming = (n.get("clientState") or "").strip()
         if CLIENT_STATE and incoming and incoming != CLIENT_STATE:
             LAST_POST = {"when": _now_iso(), "error": "client_state_mismatch", "raw": value}
             return JSONResponse({"error": "client_state_mismatch"}, status_code=403)
 
-    # Build per-user operations limited to our GROUP_IDS
     user_ops: List[Dict[str, Any]] = []
     touched_groups: set[str] = set()
 
-    # Step 1: fast-path for direct membership resources + members@delta
+    # Interpret notifications
     for n in value:
         res = (n.get("resource") or "").strip()
         change = (n.get("changeType") or "").strip().lower()
-        g_id, relation, u_id = _parse_resource(res)
 
-        # Only consider allowed groups (if present on this notification)
-        if g_id and not _is_allowed_group(g_id):
+        g_id, u_id = _parse_resource(res)
+        if not g_id or not _is_allowed_group(g_id):
             continue
 
-        # Track if our group object was updated (for delta fallback)
-        if g_id and relation is None and _is_allowed_group(g_id):
-            touched_groups.add(g_id)
-
-        # Handle direct members/owners resource form
-        if g_id and relation in {"members", "owners"} and u_id:
-            action = "updated"
-            if change == "created":
-                action = "added"
-            elif change == "deleted":
-                action = "removed"
+        # If Graph included a userId in the resource path (rare), we can enrich immediately
+        if u_id:
+            action = "added" if change == "created" else "removed" if change == "deleted" else "updated"
             try:
-                u = await _get_user_basic(u_id)
+                token = await _get_graph_token()
+                async with httpx.AsyncClient(timeout=20) as client:
+                    r = await client.get(
+                        f"{GRAPH_BASE}/users/{u_id}?$select=id,displayName,mail,userPrincipalName,otherMails,proxyAddresses",
+                        headers={"Authorization": f"Bearer {token}"}
+                    )
+                    u = r.json() if r.status_code == 200 else {"id": u_id}
             except Exception:
-                u = {"id": u_id, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}
+                u = {"id": u_id}
+            # minimal format; email resolution optional
             user_ops.append({
                 "action": action,
-                "relation": relation,
-                "user": u,
+                "relation": "members",
+                "user": {
+                    "id": u.get("id"),
+                    "displayName": u.get("displayName"),
+                    "mail": u.get("mail"),
+                    "userPrincipalName": u.get("userPrincipalName"),
+                },
                 "sourceChangeType": change or None,
                 "resource": res,
             })
+        else:
+            # Typical case: /members or /members/$ref — mark group for delta sweep
+            touched_groups.add(g_id)
 
-        # Robustly handle resourceData.members@delta
-        rd = n.get("resourceData") or {}
-        # Confirm this is one of our target groups via resourceData.id
-        rd_gid = (rd.get("id") or "").strip()
-        if rd_gid and _is_allowed_group(rd_gid):
-            members_delta = rd.get("members@delta")
-            if isinstance(members_delta, dict) and "value" in members_delta:
-                # Some tenants shape it as {'value':[...]}
-                members_delta = members_delta.get("value")
-            if isinstance(members_delta, list) and members_delta:
-                touched_groups.add(rd_gid)  # definitely a membership change
-                for item in members_delta:
-                    uid = item.get("id")
-                    if not uid:
-                        continue
-                    removed = _is_removed_marker(item.get("@removed"))
-                    action = "removed" if removed else "added"
-                    # Enrich (tolerate 404 after removal)
-                    try:
-                        u = await _get_user_basic(uid)
-                    except Exception:
-                        u = None
-                    user_ops.append({
-                        "action": action,
-                        "relation": "members",
-                        "user": (u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}),
-                        "sourceChangeType": change or None,
-                        "resource": res or f"Groups/{rd_gid}",
-                    })
-
-    # Step 2: if we still didn't get specific member ids but some groups were updated, run one delta per touched group
-    if touched_groups and not any(op for op in user_ops if op.get("action") in {"added", "removed"}):
+    # Resolve who changed via members delta (direct membership)
+    if touched_groups:
         try:
             for tg in list(touched_groups)[:10]:  # cap to be safe
                 delta = await _members_delta_once(tg)
-                for uid in delta["added"][:25]:
-                    try:
-                        u = await _get_user_basic(uid)
-                    except Exception:
-                        u = {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}
-                    user_ops.append({"action": "added", "relation": "members", "user": u, "sourceChangeType": "updated", "resource": f"Groups/{tg}"})
-                for uid in delta["removed"][:25]:
-                    try:
-                        u = await _get_user_basic(uid)
-                    except Exception:
-                        u = None
-                    user_ops.append({"action": "removed", "relation": "members", "user": (u or {"id": uid, "displayName": None, "mail": None, "userPrincipalName": None, "emailResolved": None}), "sourceChangeType": "updated", "resource": f"Groups/{tg}"})
+                for uid in delta["added"][:50]:
+                    user_ops.append({"action": "added", "relation": "members", "user": {"id": uid}, "sourceChangeType": "updated", "resource": f"Groups/{tg}"})
+                for uid in delta["removed"][:50]:
+                    user_ops.append({"action": "removed", "relation": "members", "user": {"id": uid}, "sourceChangeType": "updated", "resource": f"Groups/{tg}"})
         except Exception as e:
-            logger.warning(f"[delta fallback] failed: {e}")
+            logger.warning(f"[delta] sweep failed: {e}")
 
-    # If the notification set had nothing for our groups, ack quietly
     if not user_ops and not touched_groups:
         return JSONResponse(status_code=200, content=_ok("no-op (ignored non-target group or no member info)"))
 
-    # Dedup key based on actions + user ids + resource per op + configured groups
+    # Dedup close duplicates to reduce noise
     dedup_key = _hash_obj({
         "gids": sorted(GROUP_IDS),
         "ops": [{"a": op["action"], "id": (op.get("user") or {}).get("id"), "res": op.get("resource")} for op in user_ops]
@@ -539,30 +415,25 @@ async def notifications(request: Request):
     if _seen_recent(dedup_key):
         return JSONResponse(status_code=200, content=_ok("duplicate notification (suppressed)"))
 
-    # Build friendly summary for the UI
+    # Summary line for UI
     added = [op for op in user_ops if op["action"] == "added"]
     removed = [op for op in user_ops if op["action"] == "removed"]
-    updated = [op for op in user_ops if op["action"] == "updated"]
-
-    def _fmt(op): return _fmt_user(op["user"])
 
     parts = [f"{len(value)} notification(s)"]
     if touched_groups:
         parts.append("groups: " + ", ".join(sorted(touched_groups)))
     if added:
-        parts.append("added: " + "; ".join(_fmt(op) for op in added))
+        parts.append("added: " + "; ".join(op["user"]["id"] for op in added))
     if removed:
-        parts.append("removed: " + "; ".join(_fmt(op) for op in removed))
-    if updated and not (added or removed):
-        parts.append("updated: " + "; ".join(_fmt(op) for op in updated))
+        parts.append("removed: " + "; ".join(op["user"]["id"] for op in removed))
 
     info = {
         "when": _now_iso(),
         "client_ip": request.client.host if request.client else None,
         "count": len(value),
         "group_ids": GROUP_IDS,
-        "ops": user_ops,          # full processed operations (with action + user details)
-        "raw": value,             # original Graph payload
+        "ops": user_ops,          # normalized operations list
+        "raw": value,             # full incoming body.value for troubleshooting
         "summary": " | ".join(parts),
     }
     LAST_POST = info
@@ -571,9 +442,6 @@ async def notifications(request: Request):
 
     return JSONResponse(status_code=200, content=_ok("notification received", **info))
 
-# ------------------------
-# Debug + HTML log
-# ------------------------
 @app.get("/notifications/debug")
 async def notifications_debug():
     _load_events_from_disk()

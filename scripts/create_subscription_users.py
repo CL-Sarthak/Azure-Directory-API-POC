@@ -1,4 +1,3 @@
-# scripts/create_subscription_users.py
 import os, sys, json, datetime, requests, urllib.parse
 from dotenv import load_dotenv, find_dotenv
 
@@ -10,17 +9,19 @@ CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 
 RAW_URL       = (os.environ["NOTIFICATION_URL"] or "").strip()
 CLIENT_STATE  = os.getenv("CLIENT_STATE", "").strip()
-GROUP_ID      = os.getenv("GROUP_ID", "").strip()  # Back-compat: single group
-# NEW: support multiple group IDs, comma-separated
-GROUP_IDS     = [gid.strip() for gid in os.getenv("GROUP_IDS", "").split(",") if gid.strip()]
-if not GROUP_IDS and GROUP_ID:
-    GROUP_IDS = [GROUP_ID]  # fallback to single
+
+GROUP_IDS = [
+    "70152fd3-14b9-4363-aa50-2ae1f30462d4",
+    "c7789088-7fd5-4fc4-add7-723c533192fc",
+    "c9868d16-4236-4911-90f9-c155879b7adf",
+    "30ece3c2-80dd-49a0-bbaf-db5102889940",
+    "00184fb2-89df-4b0c-a730-8fc48fcc00a5",
+]
 
 LATEST_TLS    = os.getenv("LATEST_TLS", "v1_2").strip()
-SUB_MINUTES   = int(os.getenv("SUB_MINUTES", "4230"))  # max for directory resources
+SUB_MINUTES   = int(os.getenv("SUB_MINUTES", "4230"))
 LIFECYCLE_URL = os.getenv("LIFECYCLE_URL", "").strip()
 
-# Do NOT use includeResourceData for group membership; Graph won't give you email there.
 WITH_RESOURCE_DATA  = False
 ENCRYPTION_CERT_B64 = ""
 ENCRYPTION_CERT_ID  = ""
@@ -68,7 +69,6 @@ def expiry_iso(minutes: int) -> str:
     return (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
 def base_payload() -> dict:
-    # Removed strict single-group check; multiple groups are now supported
     payload = {
         "notificationUrl": NOTIFICATION_URL,
         "expirationDateTime": expiry_iso(SUB_MINUTES),
@@ -77,15 +77,10 @@ def base_payload() -> dict:
     }
     if LIFECYCLE_URL:
         payload["lifecycleNotificationUrl"] = LIFECYCLE_URL
-    # includeResourceData is intentionally omitted for group membership
     return payload
 
-# Exactly TWO subscriptions we want per group:
-# 1) /groups/{gid}/members with created,deleted  → membership add/remove signals
-# 2) /groups/{gid} with updated                  → backstop; your webhook calls members/delta to learn who changed
 DESIRED = [
-    {"resource": lambda gid: f"/groups/{gid}/members", "changeType": "created,deleted"},
-    {"resource": lambda gid: f"/groups/{gid}",        "changeType": "updated"},
+    {"resource": lambda gid: f"/groups/{gid}/members", "changeType": "created,deleted"}
 ]
 
 def create_subscription(resource: str, change_type: str, token: str):
@@ -134,13 +129,8 @@ def ensure_only_for_group():
     token = get_token()
     existing = list_subscriptions(token)
 
-    # Build allowed resource set for all configured groups
-    allowed = set()
-    for gid in GROUP_IDS:
-        allowed.add(f"/groups/{gid}")
-        allowed.add(f"/groups/{gid}/members")
+    allowed = set(f"/groups/{gid}/members" for gid in GROUP_IDS)
 
-    # Remove any unrelated subs that point to our webhook (e.g., /users or other groups not allowed)
     headers = {"Authorization": f"Bearer {token}"}
     for s in existing:
         if s.get("notificationUrl") != NOTIFICATION_URL:
@@ -152,10 +142,7 @@ def ensure_only_for_group():
                 print(f"[cleanup] Deleting unrelated subscription {sid} resource={res}")
                 requests.delete(f"{GRAPH_BASE}/subscriptions/{sid}", headers=headers, timeout=30)
 
-    # Re-list after cleanup
     existing = list_subscriptions(token)
-
-    # Ensure/renew the two desired subs for each group
     results = []
     for gid in GROUP_IDS:
         for spec in DESIRED:
@@ -187,20 +174,15 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "ensure"
     print("[diag] TENANT:", mask(TENANT_ID), "CLIENT:", mask(CLIENT_ID))
     print("[diag] NOTIFICATION_URL:", NOTIFICATION_URL)
-    # Keep original output and add GROUP_IDS for clarity
-    print("[diag] GROUP_ID:", GROUP_ID or "(missing)")
-    print("[diag] GROUP_IDS:", ", ".join(GROUP_IDS) if GROUP_IDS else "(none)")
     print("[diag] TLS:", LATEST_TLS or "(default)")
+    print("[diag] GROUP_IDS:", ", ".join(GROUP_IDS))
     if cmd == "list":
         print(json.dumps({"value": list_subscriptions()}, indent=2))
     elif cmd == "ensure":
         ensure_only_for_group()
     elif cmd == "renew":
         subs = list_subscriptions()
-        allowed = set()
-        for gid in GROUP_IDS:
-            allowed.add(f"/groups/{gid}")
-            allowed.add(f"/groups/{gid}/members")
+        allowed = set(f"/groups/{gid}/members" for gid in GROUP_IDS)
         for s in subs:
             if s.get("notificationUrl")==NOTIFICATION_URL and s.get("resource") in allowed:
                 renew_subscription(s["id"])
