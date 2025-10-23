@@ -46,14 +46,14 @@ LAST_VALIDATION: Optional[Dict[str, Any]] = None
 LAST_POST: Optional[Dict[str, Any]] = None
 
 EVENTS: List[Dict[str, Any]] = []
-LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")
+LOG_PATH = pathlib.Path("/tmp/graph_notifications.jsonl")  # logs can stay in /tmp
 
 LOG_INCLUDE_VALIDATIONS = (os.getenv("LOG_INCLUDE_VALIDATIONS", "false").lower() == "true")
 LOG_DEDUP_WINDOW = int(os.getenv("LOG_DEDUP_WINDOW", "300"))  # seconds to keep recent keys for dedup
 _RECENT_KEYS: deque[tuple[str, float]] = deque(maxlen=500)  # (key, ts)
 
-# Per-group delta cursor storage
-DELTA_STATE_FILE = pathlib.Path("/tmp/members_delta_state.json")
+# --- CHANGED: persist delta cursor across restarts (mount a volume to /data) ---
+DELTA_STATE_FILE = pathlib.Path("/data/members_delta_state.json")
 
 # --- Small helpers ---
 def _mask(v: str) -> str:
@@ -186,10 +186,12 @@ def _load_delta_state() -> Dict[str, Any]:
 
 def _save_delta_state(state: Dict[str, Any]) -> None:
     try:
+        DELTA_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)  # ensure /data exists
         DELTA_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         logger.warning(f"[delta] save failed: {e}")
 
+# --- CHANGED: baseline-aware delta (first run = baseline only) ---
 async def _members_delta_once(group_id: str) -> Dict[str, list]:
     """
     One delta sweep for the group's direct members.
@@ -200,24 +202,27 @@ async def _members_delta_once(group_id: str) -> Dict[str, list]:
     prev = state.get(group_id, {}).get("deltaLink")
 
     token = await _get_graph_token()
-    # Using members delta for direct membership tracking.
     url = prev or f"{GRAPH_BASE}/groups/{group_id}/members/delta?$select=id&$top=999"
 
     added, removed = set(), set()
+    is_baseline = prev is None  # first run: capture link only
+
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
             r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             r.raise_for_status()
             data = r.json()
 
-            for item in data.get("value", []):
-                oid = item.get("id")
-                if not oid:
-                    continue
-                if "@removed" in item:
-                    removed.add(oid)
-                else:
-                    added.add(oid)
+            # Only record changes after a baseline exists
+            if not is_baseline:
+                for item in data.get("value", []):
+                    oid = item.get("id")
+                    if not oid:
+                        continue
+                    if "@removed" in item:
+                        removed.add(oid)
+                    else:
+                        added.add(oid)
 
             nxt = data.get("@odata.nextLink")
             if nxt:
@@ -375,7 +380,6 @@ async def notifications(request: Request):
                     u = r.json() if r.status_code == 200 else {"id": u_id}
             except Exception:
                 u = {"id": u_id}
-            # minimal format; email resolution optional
             user_ops.append({
                 "action": action,
                 "relation": "members",
