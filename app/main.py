@@ -385,16 +385,17 @@ def _fmt_user(u: Dict[str, Any]) -> str:
 
 def _is_removed_marker(v: Any) -> bool:
     """
-    Accept both Graph shapes:
-      "@removed": "deleted"
-      "@removed": {"reason": "deleted"}
+    Accept common Graph shapes for membership delta removals.
+    Treat the presence of @removed as removal; be lenient on the reason.
     """
     if v is None:
         return False
     if isinstance(v, str):
-        return v.lower() == "deleted"
+        return v.lower() in {"deleted", "removed", "true"}
     if isinstance(v, dict):
-        return (v.get("reason") or "").lower() == "deleted"
+        reason = (v.get("reason") or "").lower()
+        # consider any @removed dict as a removal, regardless of reason variation
+        return True if v else (reason in {"deleted", "removed", "changed"})
     return False
 
 # ------------------------
@@ -402,6 +403,7 @@ def _is_removed_marker(v: Any) -> bool:
 #   - Logs events for any configured GROUP_IDS
 #   - Emits per-user ops with action + email/name
 #   - Understands resourceData["members@delta"] (added/removed)
+#   - Runs per-group delta fallback when needed (so removals aren't missed)
 # ------------------------
 @app.post("/notifications")
 async def notifications(request: Request):
@@ -443,6 +445,7 @@ async def notifications(request: Request):
     # Build per-user operations limited to our GROUP_IDS
     user_ops: List[Dict[str, Any]] = []
     touched_groups: set[str] = set()
+    groups_with_per_user_ops: set[str] = set()
 
     # Step 1: fast-path for direct membership resources + members@delta
     for n in value:
@@ -476,6 +479,8 @@ async def notifications(request: Request):
                 "sourceChangeType": change or None,
                 "resource": res,
             })
+            if g_id:
+                groups_with_per_user_ops.add(g_id)
 
         # Robustly handle resourceData.members@delta
         rd = n.get("resourceData") or {}
@@ -506,11 +511,13 @@ async def notifications(request: Request):
                         "sourceChangeType": change or None,
                         "resource": res or f"Groups/{rd_gid}",
                     })
+                groups_with_per_user_ops.add(rd_gid)
 
-    # Step 2: if we still didn't get specific member ids but some groups were updated, run one delta per touched group
-    if touched_groups and not any(op for op in user_ops if op.get("action") in {"added", "removed"}):
+    # Step 2: run delta only for groups that were touched but have no per-user ops yet
+    groups_needing_delta = {g for g in touched_groups if g not in groups_with_per_user_ops}
+    if groups_needing_delta:
         try:
-            for tg in list(touched_groups)[:10]:  # cap to be safe
+            for tg in list(groups_needing_delta)[:10]:  # cap to be safe
                 delta = await _members_delta_once(tg)
                 for uid in delta["added"][:25]:
                     try:
